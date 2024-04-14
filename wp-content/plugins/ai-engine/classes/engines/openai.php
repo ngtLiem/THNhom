@@ -1,229 +1,351 @@
 <?php
 
-class Meow_MWAI_Engines_OpenAI
+class Meow_MWAI_Engines_OpenAI extends Meow_MWAI_Engines_Core
 {
-  private $core = null;
-  private $localService = null;
-  private $defaultEnvId = null;
-  private $defaultEnv = null;
-  private $defaultApiKey = null;
+  // Base (OpenAI)
+  protected $apiKey = null;
+  protected $organizationId = null;
 
-  // OpenAI Server
-  private $defaultOpenAiEnvId = null;
-  private $defaultOpenAiEndpoint = 'https://api.openai.com/v1';
+  // Azure
+  private $azureDeployments = null;
+  private $azureApiVersion = 'api-version=2023-12-01-preview';
 
-  // Azure Server
-  private $defaultAzureEnvId = null;
-  private $defaultAzureEndpoint = null;
-  private $defaultAzureDeployments = null;
-  private $defaultAzureDeployment = null;
-  private $azureApiVersion = 'api-version=2023-07-01-preview';
+  // Response
+  protected $inModel = null;
+  protected $inId = null;
 
   // Streaming
-  private $streamTemporaryBuffer = "";
-  private $streamContent = "";
   private $streamFunctionCall = null;
-  private $streamCallback = null;
-  private $streamedTokens = 0;
 
-  // TODO: We should streamline the way we handle this envId.
-  // Would be better to have it set only once, in the constructor here.
-  // We should avoid having the setEnvironment being called from other functions.
-  public function __construct( $core, $envId = null )
+  public function __construct( $core, $env )
   {
-    $this->core = $core;
-    $this->defaultEnvId = $this->core->get_option( 'ai_default_env' );
-    $this->setEnvironment( $this->defaultEnvId );
+    parent::__construct( $core, $env );
+    $this->set_environment();
+  }
 
-    // We need $defaultAzureEnvId and $defaultOpenAiEnvId to support old versions of the plugin.
-    // We could use service="openai" or service="azure", and now we need to fetch the default envs for those services.
-    $envs = $this->core->get_option( 'ai_envs' );
-    foreach ( $envs as $env ) {
-      if ( $env['type'] === 'azure' ) {
-        $this->defaultAzureEnvId = $env['id'];
-      }
-      else if ( $env['type'] === 'openai' ) {
-        $this->defaultOpenAiEnvId = $env['id'];
-      }
+  protected function set_environment() {
+    $env = $this->env;
+    $this->apiKey = $env['apikey'];
+    
+    if ( isset( $env['organizationId'] ) ) {
+      $this->organizationId = $env['organizationId'];
     }
-
-    if ( !empty( $envId ) ) {
-      $this->setEnvironment( $envId );
+    if ( $this->envType === 'azure' ) {
+      $this->azureDeployments = isset( $env['deployments'] ) ? $env['deployments'] : [];
+      $this->azureDeployments[] = [ 'model' => 'dall-e', 'name' => 'dall-e' ];
     }
   }
 
-  function setEnvironment( $envId = null, $service = null ) {
-    $this->defaultEnv = null;
-    $envs = $this->core->get_option( 'ai_envs' );
-    if ( empty( $envId ) ) {
-      if ( $service === 'openai' ) {
-        $envId = $this->defaultOpenAiEnvId;
-      }
-      else if ( $service === 'azure' ) {
-        $envId = $this->defaultAzureEnvId;
-      }
-      else {
-        $envId = $this->defaultEnvId;
+  private function get_azure_deployment_name( $model ) {
+    foreach ( $this->azureDeployments as $deployment ) {
+      if ( $deployment['model'] === $model && !empty( $deployment['name'] ) ) {
+        return $deployment['name'];
       }
     }
-    foreach ( $envs as $env ) {
-      if ( $env['id'] === $envId ) {
-        $this->defaultEnv = $env;
-        break;
-      }
-    }
-    if ( empty( $this->defaultEnv ) ) {
-      error_log( 'No environment found for ID: ' . $envId );
-      return;
-    }
-
-    // We apply the environment to the local variables.
-    // I feel it's a bit messy, but it works well with the current system.
-    $env = $this->defaultEnv;
-    $this->localService = $env['type'] === 'azure' ? 'azure' : 'openai';
-    $this->defaultEnvId = $env['id'];
-    $this->defaultApiKey = $env['apikey'];
-    if ( $env['type'] === 'openai' ) {
-      $this->defaultOpenAiEnvId = $env['id'];
-    }
-    else if ( $env['type'] === 'azure' ) {
-      $this->defaultAzureEnvId = isset( $env['id'] ) ? $env['id'] : null;
-      $this->defaultAzureEndpoint = isset( $env['endpoint'] ) ? $env['endpoint'] : null;
-      $this->defaultAzureDeployments = isset( $env['deployments'] ) ? $env['deployments'] : null;
-      $this->defaultAzureDeployments[] = [ 'model' => 'dall-e', 'name' => 'dall-e' ];
-    }
+    throw new Exception( 'Unknown deployment for model: ' . $model );
   }
 
-  // Check for a JSON-formatted error in the data, and throw an exception if it's the case.
-  function check_for_error( $data ) {
-    if ( strpos( $data, '"error"' ) !== false ) {
-      $json = json_decode( $data, true );
-      if ( json_last_error() === JSON_ERROR_NONE ) {
-        $error = $json['error'];
-        $code = $error['code'];
-        $message = $error['message'];
-        throw new Exception( "Error $code: $message" );
-      }
-    }
+  protected function get_service_name() {
+    return $this->envType === 'azure' ? 'Azure' : 'OpenAI';
   }
 
-  /*
-    This used to be in the core.php, but since it's relative to OpenAI, it's better to have it here.
-  */
-
-  public function stream_handler( $handle, $args, $url ) {
-    curl_setopt( $handle, CURLOPT_SSL_VERIFYPEER, false );
-    curl_setopt( $handle, CURLOPT_SSL_VERIFYHOST, false );
-
-    // Maybe we could get some info from headers, as for now, there is only the model.
-    // curl_setopt( $handle, CURLOPT_HEADERFUNCTION, function( $curl, $headerLine ) {
-    //   $line = trim( $headerLine );
-    //   return strlen( $headerLine );
-    // });
-
-    curl_setopt( $handle, CURLOPT_WRITEFUNCTION, function ( $curl, $data ) {
-      $length = strlen( $data );
-
-      // FOR DEBUG:
-      // preg_match_all( '/"content":"(.*?)"/', $data, $matches );
-      // $contents = $matches[1];
-      // foreach ( $contents as $content ) {
-      //   error_log( "Content: $content" );
-      // }
-
-      // Error Management
-      $this->check_for_error( $data );
-
-      // Bufferize the unfinished stream (if it's the case)
-      $this->streamTemporaryBuffer .= $data;
-      $lines = explode( "\n", $this->streamTemporaryBuffer );
-      if ( substr( $this->streamTemporaryBuffer, -1 ) !== "\n" ) {
-        $this->streamTemporaryBuffer = array_pop( $lines );
-      }
-      else {
-        $this->streamTemporaryBuffer = "";
-      }
-
-      foreach ( $lines as $line ) {
-        if ( $line === "" ) {
-          continue;
+  private function build_prompt( $query ) {
+    $prompt = "";
+    if ( $query->mode === 'chat' ) {
+      $prompt = $query->instructions . "\n\n";
+      foreach ( $query->messages as $message ) {
+        $role = $message['role'];
+        $content = $message['content'];
+        if ( $role === 'system' ) {
+          $prompt .= "$content\n\n";
         }
-        if ( strpos($line, 'data: ' ) === 0 ) {
-          $line = substr( $line, 6 );
-          $json = json_decode( $line, true );
-
-          if ( json_last_error() === JSON_ERROR_NONE ) {
-            $content = null;
-            if ( isset( $json['choices'][0]['text'] ) ) {
-              $content = $json['choices'][0]['text'];
-            }
-            else if ( isset( $json['choices'][0]['delta']['content'] ) ) {
-              $content = $json['choices'][0]['delta']['content'];
-            }
-            else if ( isset( $json['choices'][0]['delta']['function_call'] ) ) {
-              $function_call = $json['choices'][0]['delta']['function_call'];
-              if ( empty( $this->streamFunctionCall ) ) {
-                $this->streamFunctionCall = [ 'name' => "", 'arguments' => "" ];
-              }
-              if ( isset( $function_call['name'] ) ) {
-                $this->streamFunctionCall['name'] .= $function_call['name'];
-              }
-              if ( isset( $function_call['arguments'] ) ) {
-                $this->streamFunctionCall['arguments'] .= $function_call['arguments'];
-              }
-            }
-            if ( $content !== null && $content !== "" ) {
-              $this->streamedTokens += count( explode( " ", $content ) );
-              $this->streamContent .= $content;
-              call_user_func( $this->streamCallback, $content );
-            }
-          }
-          else {
-            $this->streamTemporaryBuffer .= $line . "\n";
-          }
+        if ( $role === 'user' ) {
+          $prompt .= "User: $content\n";
+        }
+        if ( $role === 'assistant' ) {
+          $prompt .= "AI: $content\n";
         }
       }
-      return $length;
-    });
+      $prompt .= "AI: ";
+    }
+    else if ( $query->mode === 'completion' ) {
+      $prompt = $query->get_message();
+    }
+    return $prompt;
   }
 
-  private function buildHeaders( $query ) {
+  protected function build_messages( $query ) {
+    $messages = [];
+
+    // First, we need to add the first message (the instructions).
+    if ( !empty( $query->instructions ) ) {
+      $messages[] = [ 'role' => 'system', 'content' => $query->instructions ];
+    }
+
+    // Then, if any, we need to add the 'messages', they are already formatted.
+    foreach ( $query->messages as $message ) {
+      $messages[] = $message;
+    }
+
+    // If there is a context, we need to add it.
+    if ( !empty( $query->context ) ) {
+      $messages[] = [ 'role' => 'system', 'content' => $query->context ];
+    }
+
+    // Finally, we need to add the message, but if there is an image, we need to add it as a system message.
+    $fileUrl = $query->get_file_url();
+    if ( !empty( $fileUrl ) ) {
+      $messages[] = [ 
+        'role' => 'user',
+        'content' => [
+          [
+            "type" => "text",
+            "text" => $query->get_message()
+          ],
+          [
+            "type" => "image_url",
+            "image_url" => [ "url" => $fileUrl ]
+          ]
+        ]
+      ];
+    }
+    else {
+      $messages[] = [ 'role' => 'user', 'content' => $query->get_message() ];
+    }
+
+    return $messages;
+  }
+
+  protected function build_body( $query, $streamCallback = null, $extra = null ) {
+    if ( $query instanceof Meow_MWAI_Query_Text ) {
+      $body = array(
+        "model" => $query->model,
+        "n" => $query->maxResults,
+        "max_tokens" => $query->maxTokens,
+        "temperature" => $query->temperature,
+        "stream" => !is_null( $streamCallback ),
+      );
+  
+      if ( !empty( $query->stop ) ) {
+        $body['stop'] = $query->stop;
+      }
+  
+      if ( !empty( $query->responseFormat ) ) {
+        if ( $query->responseFormat === 'json' ) {
+          $body['response_format'] = [ 'type' => 'json_object' ];
+        }
+      }
+  
+      if ( !empty( $query->functions ) ) {
+        $model = $this->retrieve_model_info( $query->model );
+        if ( !empty( $model['tags'] ) && !in_array( 'functions', $model['tags'] ) ) {
+          error_log( 'The model "' . $query->model . '" doesn\'t support Function Calling.' );
+        }
+        else if ( strpos( $query->model, 'ft:' ) === 0 ) {
+          error_log( 'OpenAI doesn\'t support Function Calling with fine-tuned models yet.' );
+        }
+        else {
+          $body['functions'] = $query->functions;
+          $body['function_call'] = $query->functionCall;
+        }
+      }
+      if ( $query->mode === 'chat' ) {
+        $body['messages'] = $this->build_messages( $query );
+      }
+      else if ( $query->mode === 'completion' ) {
+        $body['prompt'] = $this->build_prompt( $query );
+      }
+      return $body;
+    }
+    else if ( $query instanceof Meow_MWAI_Query_Transcribe ) {
+      $body = array( 
+        'prompt' => $query->message,
+        'model' => $query->model,
+        'response_format' => 'text',
+        'file' => basename( $query->url ),
+        'data' => $extra
+      );
+      return $body;
+    }
+    else if ( $query instanceof Meow_MWAI_Query_Embed ) {
+      $body = array( 'input' => $query->message, 'model' => $query->model );
+      if ( $this->envType === 'azure' ) {
+        $body = array( "input" => $query->message );
+      }
+      // Dimensions are only supported by v3 models
+      if ( !empty( $query->dimensions ) && strpos( $query->model, 'ada-002' ) === false ) {
+        $body['dimensions'] = $query->dimensions;
+      }
+      return $body;
+    }
+    else if ( $query instanceof Meow_MWAI_Query_Image ) {
+      $model = $query->model;
+      $resolution = !empty( $query->resolution ) ? $query->resolution : '1024x1024';
+      $body = array(
+        "prompt" => $query->message,
+        "n" => $query->maxResults,
+        "size" => $resolution,
+      );
+      if ( $model === 'dall-e-3' ) { 
+        $body['model'] = 'dall-e-3';
+      }
+      if ( $model === 'dall-e-3-hd' ) {
+        $body['model'] = 'dall-e-3';
+        $body['quality'] = 'hd';
+      }
+      if ( !empty( $query->style ) && strpos( $model, 'dall-e-3' ) === 0 ) {
+        $body['style'] = $query->style;
+      }
+      return $body;
+    }
+  }
+
+  protected function build_url( $query, $endpoint = null ) {
+    $url = "";
+    $env = $this->env;
+    // This endpoint is basically OpenAI or Azure, but in the case this class
+    // is overriden, we can pass the endpoint directly (for OpenRouter or HuggingFace, for example).
+    if ( empty( $endpoint ) ) {
+      if ( $this->envType === 'openai' ) {
+        $endpoint = apply_filters( 'mwai_openai_endpoint', 'https://api.openai.com/v1', $this->env );
+        $this->organizationId = isset( $env['organizationId'] ) ? $env['organizationId'] : null;
+      }
+      else if ( $this->envType === 'azure' ) {
+        $endpoint = isset( $env['endpoint'] ) ? $env['endpoint'] : null;
+      }
+      else {
+        throw new Exception( 'Endpoing is not defined, and this envType is not known: ' . $this->envType );
+      }
+    }
+    // Add the base API to the URL
+    if ( $query instanceof Meow_MWAI_Query_Text ) {
+      if ( $this->envType === 'azure' ) {
+        $deployment_name = $this->get_azure_deployment_name( $query->model );
+        $url = trailingslashit( $endpoint ) . 'openai/deployments/' . $deployment_name;
+        if ( $query->mode === 'chat' ) {
+          $url .= '/chat/completions?' . $this->azureApiVersion;
+        }
+        else if ($query->mode === 'completion') {
+          $url .= '/completions?' . $this->azureApiVersion;
+        }
+      }
+      else {
+        if ( $query->mode === 'chat' ) {
+          $url .= trailingslashit( $endpoint ) . 'chat/completions';
+        }
+        else if ( $query->mode === 'completion' ) {
+          $url .= trailingslashit( $endpoint ) . 'completions';
+        }
+      }
+      return $url;
+    }
+    else if ( $query instanceof Meow_MWAI_Query_Transcribe ) {
+      $modeEndpoint = $query->mode === 'translation' ? 'translations' : 'transcriptions';
+      $url .= trailingslashit( $endpoint ) . 'audio/' . $modeEndpoint;
+      return $url;
+    }
+    else if ( $query instanceof Meow_MWAI_Query_Embed ) {
+      $url .= trailingslashit( $endpoint ) . 'embeddings';
+      if ( $this->envType === 'azure' ) {
+        $deployment_name = $this->get_azure_deployment_name( $query->model );
+        $url = trailingslashit( $endpoint ) . 'openai/deployments/' .
+          $deployment_name . '/embeddings?' . $this->azureApiVersion;
+      }
+      return $url;
+    }
+    else if ( $query instanceof Meow_MWAI_Query_Image ) {
+      $url .= trailingslashit( $endpoint ) . 'images/generations';
+      if ( $this->envType === 'azure' ) {
+        $deployment_name = $this->get_azure_deployment_name( $query->model );
+        $url = trailingslashit( $endpoint ) . 'openai/deployments/' .
+          $deployment_name . '/images/generations?' . $this->azureApiVersion;
+      }
+      return $url;
+    }
+    throw new Exception( 'The query is not supported by build_url().' );
+  }
+
+  protected function build_headers( $query ) {
+    if ( $query->apiKey ) {
+      $this->apiKey = $query->apiKey;
+    }
+    if ( empty( $this->apiKey ) ) {
+      throw new Exception( 'No API Key provided. Please visit the Settings.' );
+    }
     $headers = array(
       'Content-Type' => 'application/json',
-      'Authorization' => 'Bearer ' . $this->defaultApiKey,
+      'Authorization' => 'Bearer ' . $this->apiKey,
     );
-    if ( $this->localService === 'azure' ) {
-      $headers = array( 'Content-Type' => 'application/json', 'api-key' => $this->defaultApiKey );
+    if ( $this->organizationId ) {
+      $headers['OpenAI-Organization'] = $this->organizationId;
+    }
+    if ( $this->envType === 'azure' ) {
+      $headers = array( 'Content-Type' => 'application/json', 'api-key' => $this->apiKey );
     }
     return $headers;
   }
 
-  private function buildOptions( $headers, $json = null, $forms = null ) {
-
-    // Build body
+  protected function build_options( $headers, $json = null, $forms = null, $method = 'POST' ) {
     $body = null;
     if ( !empty( $forms ) ) {
       $boundary = wp_generate_password ( 24, false );
       $headers['Content-Type'] = 'multipart/form-data; boundary=' . $boundary;
-      $body = $this->buildFormBody( $forms, $boundary );
+      $body = $this->build_form_body( $forms, $boundary );
     }
     else if ( !empty( $json ) ) {
       $body = json_encode( $json );
     }
-
-    // Build options
     $options = array(
       'headers' => $headers,
-      'method' => 'POST',
+      'method' => $method,
       'timeout' => MWAI_TIMEOUT,
       'body' => $body,
       'sslverify' => false
     );
-
     return $options;
   }
 
-  public function runQuery( $url, $options, $isStream = false ) {
+  protected function stream_data_handler( $json ) {
+    $content = null;
+
+    // Get additional data from the JSON
+    if ( isset( $json['model'] ) ) {
+      $this->inModel = $json['model'];
+    }
+    if ( isset( $json['id'] ) ) {
+      $this->inId = $json['id'];
+    }
+
+    // Get the content
+    if ( isset( $json['choices'][0]['text'] ) ) {
+      $content = $json['choices'][0]['text'];
+    }
+    else if ( isset( $json['choices'][0]['delta']['content'] ) ) {
+      $content = $json['choices'][0]['delta']['content'];
+    }
+    else if ( isset( $json['choices'][0]['delta']['function_call'] ) ) {
+      $function_call = $json['choices'][0]['delta']['function_call'];
+      if ( empty( $this->streamFunctionCall ) ) {
+        $this->streamFunctionCall = [ 'name' => "", 'arguments' => "" ];
+      }
+      if ( isset( $function_call['name'] ) ) {
+        $this->streamFunctionCall['name'] .= $function_call['name'];
+      }
+      if ( isset( $function_call['arguments'] ) ) {
+        $this->streamFunctionCall['arguments'] .= $function_call['arguments'];
+      }
+    }
+
+    // Avoid some endings
+    $endings = [ "<|im_end|>", "</s>" ];
+    if ( in_array( $content, $endings ) ) {
+      $content = null;
+    }
+
+    return ( $content === '0' || !empty( $content ) ) ? $content : null;
+  }
+
+  public function run_query( $url, $options, $isStream = false ) {
     try {
       $options['stream'] = $isStream;
       if ( $isStream ) {
@@ -235,6 +357,21 @@ class Meow_MWAI_Engines_OpenAI
         throw new Exception( $res->get_error_message() );
       }
 
+      $responseCode = wp_remote_retrieve_response_code( $res );
+      if ( $responseCode === 404 ) {
+        throw new Exception( 'The model\'s API URL was not found: ' . $url );
+      }
+      if ( $responseCode === 400 ) {
+        $message = wp_remote_retrieve_body( $res );
+        if ( empty( $message ) ) {
+          $message = wp_remote_retrieve_response_message( $res );
+        }
+        if ( empty( $message ) ) {
+          $message = 'Bad Request';
+        }
+        throw new Exception( $message );
+      }
+
       if ( $isStream ) {
         return [ 'stream' => true ]; 
       }
@@ -243,22 +380,17 @@ class Meow_MWAI_Engines_OpenAI
       $headersRes = wp_remote_retrieve_headers( $res );
       $headers = $headersRes->getAll();
 
-      // If Headers contains multipart/form-data then we don't need to decode the response
-      if ( strpos( $options['headers']['Content-Type'], 'multipart/form-data' ) !== false ) {
-        return [
-          'stream' => false,
-          'headers' => $headers,
-          'data' => $response
-        ];
+      // Check if Content-Type is 'multipart/form-data' or 'text/plain'
+      // If so, we don't need to decode the response
+      $normalizedHeaders = array_change_key_case( $headers, CASE_LOWER );
+      $resContentType = $normalizedHeaders['content-type'] ?? '';
+      if ( strpos( $resContentType, 'multipart/form-data' ) !== false || strpos( $resContentType, 'text/plain' ) !== false ) {
+        return [ 'stream' => false, 'headers' => $headers, 'data' => $response ];
       }
 
       $data = json_decode( $response, true );
-      $this->handleResponseErrors( $data );
-
-      return [
-        'headers' => $headers,
-        'data' => $data
-      ];
+      $this->handle_response_errors( $data );
+      return [ 'headers' => $headers, 'data' => $data ];
     }
     catch ( Exception $e ) {
       error_log( $e->getMessage() );
@@ -266,34 +398,7 @@ class Meow_MWAI_Engines_OpenAI
     }
   }
 
-  private function applyQueryParameters( $query ) {
-    $this->setEnvironment( $query->envId, $query->service );
-
-    // But if the service is set to Azure and the deployments/models are available,
-    // then we will use Azure instead.
-    if ( $this->localService === 'azure' && !empty( $this->defaultAzureDeployments ) ) {
-      $found = false;
-      foreach ( $this->defaultAzureDeployments as $deployment ) {
-        if ( $deployment['model'] === $query->model && !empty( $deployment['name'] ) ) {
-          $this->defaultAzureDeployment = $deployment['name'];
-          $found = true;
-          break;
-        }
-      }
-      if ( !$found ) {
-        $this->setEnvironment( $this->defaultOpenAiEnvId );
-      }
-    }
-
-    if ( !empty( $query->apiKey ) ) {
-      $this->defaultApiKey = $query->apiKey;
-    }
-
-    // This envId will still be used later for logging.
-    $query->envId = $this->defaultEnvId;
-  }
-
-  private function getAudio( $url ) {
+  private function get_audio( $url ) {
     require_once( ABSPATH . 'wp-admin/includes/media.php' );
     $tmpFile = tempnam( sys_get_temp_dir(), 'audio_' );
     file_put_contents( $tmpFile, file_get_contents( $url ) );
@@ -307,254 +412,239 @@ class Meow_MWAI_Engines_OpenAI
     return [ 'data' => $data, 'length' => $length ];
   }
 
-  public function runTranscribeQuery( $query ) {
-    $this->applyQueryParameters( $query );
-
-    // Prepare the request.
-    $modeEndpoint = $query->mode === 'translation' ? 'translations' : 'transcriptions';
-    $url = 'https://api.openai.com/v1/audio/' . $modeEndpoint;
-
+  public function run_transcribe_query( $query ) {
     // Check if the URL is valid.
     if ( !filter_var( $query->url, FILTER_VALIDATE_URL ) ) {
       throw new Exception( 'Invalid URL for transcription.' );
     }
 
-    $audioData = $this->getAudio( $query->url );
-    $body = array( 
-      'prompt' => $query->prompt,
-      'model' => $query->model,
-      'response_format' => 'text',
-      'file' => basename( $query->url ),
-      'data' => $audioData['data']
-    );
-    $headers = $this->buildHeaders( $query );
-    $options = $this->buildOptions( $headers, null, $body );
+    $audioData = $this->get_audio( $query->url );
+    $body = $this->build_body( $query, null, $audioData['data'] );
+    $url = $this->build_url( $query );
+    $headers = $this->build_headers( $query );
+    $options = $this->build_options( $headers, null, $body );
 
     // Perform the request
     try { 
-      $res = $this->runQuery( $url, $options );
+      $res = $this->run_query( $url, $options );
       $data = $res['data'];
       if ( empty( $data ) ) {
         throw new Exception( 'Invalid data for transcription.' );
       }
-      $this->check_for_error( $data );
-      $usage = $this->core->recordAudioUsage( $query->model, $audioData['length'] );
+      $usage = $this->core->record_audio_usage( $query->model, $audioData['length'] );
       $reply = new Meow_MWAI_Reply( $query );
-      $reply->setUsage( $usage );
-      $reply->setChoices( $data );
+      $reply->set_usage( $usage );
+      $reply->set_choices( $data );
       return $reply;
     }
     catch ( Exception $e ) {
       error_log( $e->getMessage() );
-      $service = $this->localService === 'azure' ? 'Azure' : 'OpenAI';
-      throw new Exception( $e->getMessage() . " ($service)" );
+      $service = $this->get_service_name();
+      throw new Exception( "From $service: " . $e->getMessage() );
     }
   }
 
-  public function runEmbeddingQuery( $query ) {
-    $this->applyQueryParameters( $query );
+  public function run_embedding_query( $query ) {
+    $body = $this->build_body( $query );
+    $url = $this->build_url( $query );
+    $headers = $this->build_headers( $query );
+    $options = $this->build_options( $headers, $body );
 
-    // Prepare the request
-    $url = 'https://api.openai.com/v1/embeddings';
-    $body = array( 'input' => $query->prompt, 'model' => $query->model );
-    if ( $this->localService === 'azure' ) {
-      $url = trailingslashit( $this->defaultAzureEndpoint ) . 'openai/deployments/' .
-        $this->defaultAzureDeployment . '/embeddings?' . $this->azureApiVersion;
-      $body = array( "input" => $query->prompt );
-    }
-    $headers = $this->buildHeaders( $query );
-    $options = $this->buildOptions( $headers, $body );
-
-    // Perform the request
     try {
-      $res = $this->runQuery( $url, $options );
+      $res = $this->run_query( $url, $options );
       $data = $res['data'];
       if ( empty( $data ) || !isset( $data['data'] ) ) {
         throw new Exception( 'Invalid data for embedding.' );
       }
       $usage = $data['usage'];
-      $this->core->recordTokensUsage( $query->model, $usage['prompt_tokens'] );
+      $this->core->record_tokens_usage( $query->model, $usage['prompt_tokens'] );
       $reply = new Meow_MWAI_Reply( $query );
-      $reply->setUsage( $usage );
-      $reply->setChoices( $data['data'] );
+      $reply->set_usage( $usage );
+      $reply->set_choices( $data['data'] );
       return $reply;
     }
     catch ( Exception $e ) {
-      error_log( $e->getMessage() );
-      $service = $this->localService === 'azure' ? 'Azure' : 'OpenAI';
-      throw new Exception( $e->getMessage() . " ($service)" );
+      $message = $e->getMessage();
+      $error = $this->try_decode_error( $message );
+      if ( !is_null( $error ) ) {
+        $message = $error;
+      }
+      error_log( $message );
+      $service = $this->get_service_name();
+      throw new Exception( "From $service: " . $message );
     }
   }
 
-  public function runCompletionQuery( $query, $streamCallback = null ) {
-    $this->applyQueryParameters( $query );
+  public function try_decode_error( $data ) {
+    $json = json_decode( $data, true );
+    if ( isset( $json['error']['message'] ) ) {
+      return $json['error']['message'];
+    }
+    return null;
+  }
+
+  public function run_completion_query( $query, $streamCallback = null ) : Meow_MWAI_Reply {
     if ( !is_null( $streamCallback ) ) {
       $this->streamCallback = $streamCallback;
-      add_action( 'http_api_curl', array( $this, 'stream_handler' ), 10, 3 );
+      add_action( 'http_api_curl', [ $this, 'stream_handler' ], 10, 3 );
     }
     if ( $query->mode !== 'chat' && $query->mode !== 'completion' ) {
       throw new Exception( 'Unknown mode for query: ' . $query->mode );
     }
 
-    // Prepare the request
-    $body = array(
-      "model" => $query->model,
-      "stop" => $query->stop,
-      "n" => $query->maxResults,
-      "max_tokens" => $query->maxTokens,
-      "temperature" => $query->temperature,
-      "stream" => !is_null( $streamCallback ),
-    );
-    if ( !empty( $query->functions ) ) {
-      if ( strpos( $query->model, 'ft:' ) === 0 ) {
-        throw new Exception( 'OpenAI doesn\'t support Function Calling with fine-tuned models yet.' );
-      }
-      $body['functions'] = $query->functions;
-      $body['function_call'] = $query->functionCall;
-    }
-    if ( $query->mode === 'chat' ) {
-      $body['messages'] = $query->messages;
-    }
-    else if ( $query->mode === 'completion' ) {
-      $body['prompt'] = $query->getPrompt();
-    }
-    $url = $this->localService === 'azure' ? trailingslashit( $this->defaultAzureEndpoint ) . 
-      'openai/deployments/' . $this->defaultAzureDeployment : $this->defaultOpenAiEndpoint;
-    if ( $query->mode === 'chat' ) {
-      $url .= $this->localService === 'azure' ? '/chat/completions?' . $this->azureApiVersion : '/chat/completions';
-    }
-    else if ($query->mode === 'completion') {
-      $url .= $this->localService === 'azure' ? '/completions?' . $this->azureApiVersion : '/completions';
-    }
-    $headers = $this->buildHeaders( $query );
-    $options = $this->buildOptions( $headers, $body );
+    $body = $this->build_body( $query, $streamCallback );
+    $url = $this->build_url( $query );
+    $headers = $this->build_headers( $query );
+    $options = $this->build_options( $headers, $body );
 
     try {
-      $res = $this->runQuery( $url, $options, $streamCallback );
+      $res = $this->run_query( $url, $options, $streamCallback );
       $reply = new Meow_MWAI_Reply( $query );
 
-      // Streamed data
+      $returned_id = null;
+      $returned_model = $this->inModel;
+      $returned_in_tokens = null;
+      $returned_out_tokens = null;
+      $returned_price = null;
+      $returned_choices = [];
+
       if ( !is_null( $streamCallback ) ) {
-        $data = [
-          'model' => $query->model,
-          'usage' => [
-            'prompt_tokens' => $query->getPromptTokens(),
-            'completion_tokens' => $this->streamedTokens
-          ],
-          'choices' => [
-            [ 
-              'message' => [ 
-                'content' => $this->streamContent,
-                'function_call' => $this->streamFunctionCall
-              ]
+        // Streamed data
+        if ( empty( $this->streamContent ) ) {
+          $error = $this->try_decode_error( $this->streamBuffer );
+          if ( !is_null( $error ) ) {
+            throw new Exception( $error );
+          }
+        }
+        $returned_id = $this->inId;
+        $returned_model = $this->inModel ? $this->inModel : $query->model;
+        $returned_choices = [
+          [ 
+            'message' => [ 
+              'content' => $this->streamContent,
+              'function_call' => $this->streamFunctionCall
             ]
-          ],
+          ]
         ];
       }
-      // Regular data
       else {
+        // Regular data
         $data = $res['data'];
+        if ( empty( $data ) ) {
+          throw new Exception( 'No content received (res is null).' );
+        }
         if ( !$data['model'] ) {
           error_log( print_r( $data, 1 ) );
-          throw new Exception( "Got an unexpected response from OpenAI. Check your PHP Error Logs." );
+          throw new Exception( 'Invalid response (no model information).' );
         }
+        $returned_id = $data['id'];
+        $returned_model = $data['model'];
+        $returned_in_tokens = isset( $data['usage']['prompt_tokens'] ) ?
+          $data['usage']['prompt_tokens'] : null;
+        $returned_out_tokens = isset( $data['usage']['completion_tokens'] ) ?
+          $data['usage']['completion_tokens'] : null;
+        $returned_price = isset( $data['usage']['total_cost'] ) ?
+          $data['usage']['total_cost'] : null;
+        $returned_choices = $data['choices'];
       }
       
-      try {
-        $usage = $this->core->recordTokensUsage( 
-          $data['model'], 
-          $data['usage']['prompt_tokens'],
-          $data['usage']['completion_tokens']
-        );
+      // Set the results.
+      $reply->set_choices( $returned_choices );
+      if ( !empty( $returned_id ) ) {
+        $reply->set_id( $returned_id );
       }
-      catch ( Exception $e ) {
-        error_log( $e->getMessage() );
-      }
-      $reply->setUsage( $usage );
-      $reply->setChoices( $data['choices'] );
+
+      // Handle tokens.
+      $this->handle_tokens_usage( 
+        $reply, $query,
+        $returned_model,
+        $returned_in_tokens,
+        $returned_out_tokens,
+        $returned_price
+      );
+
       return $reply;
     }
     catch ( Exception $e ) {
       error_log( $e->getMessage() );
-      $service = $this->localService === 'azure' ? 'Azure' : 'OpenAI';
-      throw new Exception( $e->getMessage() . " ($service)" );
+      $service = $this->get_service_name();
+      $message = "From $service: " . $e->getMessage();
+      throw new Exception( $message );
     }
   }
 
-  // Request to DALL-E API
-  public function runImagesQuery( $query ) {
-    $this->applyQueryParameters( $query );
-
-    // Prepare the request
-    $url = 'https://api.openai.com/v1/images/generations';
-    $body = array(
-      "prompt" => $query->prompt,
-      "n" => $query->maxResults,
-      "size" => '1024x1024',
+  public function handle_tokens_usage( $reply, $query, $returned_model,
+    $returned_in_tokens, $returned_out_tokens, $returned_price = null ) {
+    $returned_in_tokens = !is_null( $returned_in_tokens ) ? $returned_in_tokens :
+      $reply->get_in_tokens( $query );
+    $returned_out_tokens = !is_null( $returned_out_tokens ) ? $returned_out_tokens :
+      $reply->get_out_tokens();
+    $returned_price = !is_null( $returned_price ) ? $returned_price :
+      $reply->get_price();
+    $usage = $this->core->record_tokens_usage(
+      $returned_model,
+      $returned_in_tokens,
+      $returned_out_tokens,
+      $returned_price
     );
-    if ( $this->localService === 'azure' ) {
-      $url = trailingslashit( $this->defaultAzureEndpoint ) . 'dalle/text-to-image?api-version=2022-08-03-preview';
-      $body = array( 
-        "caption" => $query->prompt,
-        //"n" => $query->maxResults,
-        "resolution" => '1024x1024',
-      );
-     }
-    $headers = $this->buildHeaders( $query );
-    $options = $this->buildOptions( $headers, $body );
+    $reply->set_usage( $usage );
+  }
 
-    // Perform the request
+  // Request to DALL-E API
+  public function run_images_query( $query ) {
+    $body = $this->build_body( $query );
+    $url = $this->build_url( $query );
+    $headers = $this->build_headers( $query );
+    $options = $this->build_options( $headers, $body );
+
     try {
-      $res = $this->runQuery( $url, $options );
+      $res = $this->run_query( $url, $options );
       $data = $res['data'];
       $choices = [];
-
-      if ( $this->localService === 'azure' ) {
-        if ( !isset( $res['headers']['operation-location'] ) || !isset( $res['headers']['retry-after'] ) ) {
-          throw new Exception( 'Invalid response from Azure.' );
+      if ( $this->envType === 'azure' ) {
+        foreach ( $data['data'] as $entry ) {
+          $choices[] = [ 'url' => $entry['url'] ];
         }
-        $operationLocation = $res['headers']['operation-location'];
-        $retryAfter = (int)$res['headers']['retry-after'];
-        $status = $data['status'];
-        $options = $this->buildOptions( $headers, null );
-        $options['method'] = 'GET';
-        while ( $status !== 'Succeeded' ) {
-          sleep( $retryAfter );
-          $res = $this->runQuery( $operationLocation, $options );
-          $data = $res['data'];
-          $status = $data['status'];
-        }
-        $result = $data['result'];
-        $contentUrl = $result['contentUrl'];
-        $choices = [ [ 'url' => $contentUrl ] ];
-
       }
       else {
-        // OpenAI returns an array of URLs
         $choices = $data['data'];
       }
 
       $reply = new Meow_MWAI_Reply( $query );
-      $usage = $this->core->recordImagesUsage( "dall-e", "1024x1024", $query->maxResults );
-      $reply->setUsage( $usage );
-      $reply->setChoices( $choices );
-      $reply->setType( 'images' );
+      $model = $query->model;
+      $resolution = !empty( $query->resolution ) ? $query->resolution : '1024x1024';
+      $usage = $this->core->record_images_usage( $model, $resolution, $query->maxResults );
+      $reply->set_usage( $usage );
+      $reply->set_choices( $choices );
+      $reply->set_type( 'images' );
+      
+      if ( $query->localDownload === 'uploads' || $query->localDownload === 'library' ) {
+        foreach ( $reply->results as &$result ) {
+          $fileId = $this->core->files->upload_file( $result, null, 'generated', [
+            'query_envId' => $query->envId,
+            'query_session' => $query->session,
+            'query_model' => $query->model,
+          ], $query->envId, $query->localDownload, $query->localDownloadExpiry );
+          $fileUrl = $this->core->files->get_url( $fileId );
+          $result = $fileUrl;
+        }
+      }
+      $reply->result = $reply->results[0];
       return $reply;
     }
     catch ( Exception $e ) {
       error_log( $e->getMessage() );
-      $service = $this->localService === 'azure' ? 'Azure' : 'OpenAI';
-      throw new Exception( $e->getMessage() . " ($service)" );
+      $service = $this->get_service_name();
+      throw new Exception( "From $service: " . $e->getMessage() );
     }
   }
-
 
   /*
     This is the rest of the OpenAI API support, not related to the models directly.
   */
 
   // Check if there are errors in the response from OpenAI, and throw an exception if so.
-  public function handleResponseErrors( $data ) {
+  protected function handle_response_errors( $data ) {
     if ( isset( $data['error'] ) ) {
       $message = $data['error']['message'];
       if ( preg_match( '/API key provided(: .*)\./', $message, $matches ) ) {
@@ -564,12 +654,12 @@ class Meow_MWAI_Engines_OpenAI
     }
   }
 
-  public function listFiles()
+  public function list_files()
   {
-    return $this->run( 'GET', '/files' );
+    return $this->execute( 'GET', '/files' );
   }
 
-  static function getSuffixForModel($model)
+  static function get_suffix_for_model($model)
   {
     // Legacy fine-tuned models
     preg_match( "/:([a-zA-Z0-9\-]{1,40})-([0-9]{4})-([0-9]{2})-([0-9]{2})/", $model, $matches);
@@ -586,7 +676,7 @@ class Meow_MWAI_Engines_OpenAI
     return 'N/A';
   }
 
-  static function getBaseModelForFinetune($model)
+  static function get_finetune_base_model($model)
   {
     // New fine-tuned models
     preg_match("/^ft:([^:]+):/", $model, $matches);
@@ -609,9 +699,9 @@ class Meow_MWAI_Engines_OpenAI
     return null;
   }
 
-  public function listDeletedFineTunes( $envId = null, $legacy = false ) 
+  public function list_deleted_finetunes( $envId = null, $legacy = false ) 
   {
-    $finetunes = $this->listFineTunes( $legacy );
+    $finetunes = $this->list_finetunes( $legacy );
     $deleted = [];
 
     foreach ( $finetunes as $finetune ) {
@@ -619,7 +709,7 @@ class Meow_MWAI_Engines_OpenAI
       $isSucceeded = $finetune['status'] === 'succeeded';
       if ( $isSucceeded ) {
         try {
-          $finetune = $this->getModel( $name );
+          $finetune = $this->get_model( $name );
         }
         catch ( Exception $e ) {
           $deleted[] = $name;
@@ -627,35 +717,35 @@ class Meow_MWAI_Engines_OpenAI
       }
     }
     if ( $legacy ) {
-      $this->core->update_ai_env( $this->defaultOpenAiEnvId, 'legacy_finetunes_deleted', $deleted );
+      $this->core->update_ai_env( $this->envId, 'legacy_finetunes_deleted', $deleted );
     }
     else {
-      $this->core->update_ai_env( $this->defaultOpenAiEnvId, 'finetunes_deleted', $deleted );
+      $this->core->update_ai_env( $this->envId, 'finetunes_deleted', $deleted );
     }
     return $deleted;
   }
 
   // public function listModels() {
-  //   $res = $this->run( 'GET', '/models' );
+  //   $res = $this->execute( 'GET', '/models' );
   //   // TODO: Not used by the UI.
   //   throw new Exception( 'Not implemented yet.' );
   // }
 
   // TODO: This was used to retrieve the fine-tuned models, but not sure this is how we should
   // retrieve all the models since Summer 2023, let's see! WIP.
-  public function listFineTunes( $legacy = false )
+  public function list_finetunes( $legacy = false )
   {
     if ( $legacy ) {
-      $res = $this->run( 'GET', '/fine-tunes' );
+      $res = $this->execute( 'GET', '/fine-tunes' );
     }
     else {
-      $res = $this->run( 'GET', '/fine_tuning/jobs' );
+      $res = $this->execute( 'GET', '/fine_tuning/jobs' );
     }
     $finetunes = $res['data'];
 
     // Add suffix
     $finetunes = array_map( function ( $finetune ) {
-      $finetune['suffix'] = SELF::getSuffixForModel( $finetune['fine_tuned_model'] );
+      $finetune['suffix'] = SELF::get_suffix_for_model( $finetune['fine_tuned_model'] );
       $finetune['createdOn'] = date( 'Y-m-d H:i:s', $finetune['created_at'] );
       $finetune['updatedOn'] = date( 'Y-m-d H:i:s', $finetune['updated_at'] );
       $finetune['base_model'] = $finetune['model'];
@@ -676,58 +766,76 @@ class Meow_MWAI_Engines_OpenAI
     });
 
     if ( $legacy ) {
-      $this->core->update_ai_env( $this->defaultOpenAiEnvId, 'legacy_finetunes', $finetunes );
+      $this->core->update_ai_env( $this->envId, 'legacy_finetunes', $finetunes );
     }
     else {
-      $this->core->update_ai_env( $this->defaultOpenAiEnvId, 'finetunes', $finetunes );
+      $this->core->update_ai_env( $this->envId, 'finetunes', $finetunes );
     }
 
     return $finetunes;
   }
 
   public function moderate( $input ) {
-    $result = $this->run('POST', '/moderations', [
+    $result = $this->execute('POST', '/moderations', [
       'input' => $input
     ]);
     return $result;
   }
 
-  public function uploadFile( $filename, $data )
+  public function upload_file( $filename, $data, $purpose = 'fine-tune' )
   {
-    $result = $this->run('POST', '/files', null, [
-      'purpose' => 'fine-tune',
+    $result = $this->execute('POST', '/files', null, [
+      'purpose' => $purpose,
       'data' => $data,
       'file' => $filename
     ] );
     return $result;
   }
 
-  public function deleteFile( $fileId )
+  public function delete_file( $fileId )
   {
-    return $this->run('DELETE', '/files/' . $fileId);
+    return $this->execute( 'DELETE', '/files/' . $fileId );
   }
 
-  public function getModel( $modelId )
+  public function get_model( $modelId )
   {
-    return $this->run('GET', '/models/' . $modelId);
+    return $this->execute( 'GET', '/models/' . $modelId );
   }
 
-  public function cancelFineTune( $fineTuneId )
+  public function cancel_finetune( $fineTuneId )
   {
-    return $this->run('POST', '/fine-tunes/' . $fineTuneId . '/cancel');
+    return $this->execute( 'POST', '/fine-tunes/' . $fineTuneId . '/cancel' );
   }
 
-  public function deleteFineTune( $modelId )
+  public function delete_finetune( $modelId )
   {
-    return $this->run('DELETE', '/models/' . $modelId);
+    return $this->execute( 'DELETE', '/models/' . $modelId );
   }
 
-  public function downloadFile( $fileId )
-  {
-    return $this->run('GET', '/files/' . $fileId . '/content', null, null, false);
+  public function download_file( $fileId, $newFile = null ) {
+    $fileInfo = $this->execute( 'GET', '/files/' . $fileId, null, null, false );
+    $fileInfo = json_decode( (string)$fileInfo, true );
+    $filename = $fileInfo['filename'];
+    $extension = pathinfo( $filename, PATHINFO_EXTENSION );
+    if ( empty( $newFile ) ) {
+      include_once( ABSPATH . 'wp-admin/includes/file.php' );
+      $tempFile = wp_tempnam( $filename );
+      if ( !$tempFile ) {
+        $tempFile = tempnam( sys_get_temp_dir(), 'download_' );
+      }
+      if ( pathinfo( $tempFile, PATHINFO_EXTENSION ) != $extension ) {
+        $newFile = $tempFile . '.' . $extension;
+      }
+      else {
+        $newFile = $tempFile;
+      }
+    }
+    $data = $this->execute( 'GET', '/files/' . $fileId . '/content', null, null, false );
+    file_put_contents( $newFile, $data );
+    return $newFile;
   }
 
-  public function fineTuneFile( $fileId, $model, $suffix, $hyperparams = [], $legacy = false )
+  public function run_finetune( $fileId, $model, $suffix, $hyperparams = [], $legacy = false )
   {
     $n_epochs = isset( $hyperparams['nEpochs'] ) ? (int)$hyperparams['nEpochs'] : null;
     $batch_size = isset( $hyperparams['batchSize'] ) ? (int)$hyperparams['batchSize'] : null;
@@ -741,7 +849,7 @@ class Meow_MWAI_Engines_OpenAI
       'suffix' => $suffix
     ];
     if ( $legacy ) {
-      $result = $this->run( 'POST', '/fine-tunes', $arguments );
+      $result = $this->execute( 'POST', '/fine-tunes', $arguments );
     }
     else {
       if ( $n_epochs ) {
@@ -769,7 +877,7 @@ class Meow_MWAI_Engines_OpenAI
       if ( $model === 'turbo' ) {
         $arguments['model'] = 'gpt-3.5-turbo';
       }
-      $result = $this->run( 'POST', '/fine_tuning/jobs', $arguments );
+      $result = $this->execute( 'POST', '/fine_tuning/jobs', $arguments );
     }
     return $result;
   }
@@ -783,7 +891,7 @@ class Meow_MWAI_Engines_OpenAI
     * @param string $boundary
     * @return string
    */
-  public function buildFormBody( $fields, $boundary )
+  public function build_form_body( $fields, $boundary )
   {
     $body = '';
     foreach ( $fields as $name => $value ) {
@@ -807,7 +915,7 @@ class Meow_MWAI_Engines_OpenAI
 
   /**
     * Run a request to the OpenAI API.
-    * Fore more information about the $formFields, refer to the buildFormBody method.
+    * Fore more information about the $formFields, refer to the build_form_body method.
     *
     * @param string $method POST, PUT, GET, DELETE...
     * @param string $url The API endpoint
@@ -816,17 +924,35 @@ class Meow_MWAI_Engines_OpenAI
     * @param bool $json Whether to return the response as json or not
     * @return array
    */
-  public function run( $method, $url, $query = null, $formFields = null, $json = true )
+  public function execute( $method, $url, $query = null, $formFields = null, $json = true, $extraHeaders = null )
   {
-    $headers = "Content-Type: application/json\r\n" . "Authorization: Bearer " . $this->defaultApiKey . "\r\n";
+    $headers = "Content-Type: application/json\r\n" . "Authorization: Bearer " . $this->apiKey . "\r\n";
+    if ( $this->organizationId ) {
+      $headers .= "OpenAI-Organization: " . $this->organizationId . "\r\n";
+    }
     $body = $query ? json_encode( $query ) : null;
     if ( !empty( $formFields ) ) {
-      $boundary = wp_generate_password (24, false );
-      $headers  = [
+      $boundary = wp_generate_password( 24, false );
+      $headers = [
         'Content-Type' => 'multipart/form-data; boundary=' . $boundary,
-        'Authorization' => 'Bearer ' . $this->defaultApiKey
+        'Authorization' => 'Bearer ' . $this->apiKey
       ];
-      $body = $this->buildFormBody( $formFields, $boundary );
+      if ( $this->organizationId ) {
+        $headers['OpenAI-Organization'] = $this->organizationId;
+      }
+      $body = $this->build_form_body( $formFields, $boundary );
+    }
+
+    // Maybe we should have headers always as an array... not sure why we have it as a string.
+    if ( !empty( $extraHeaders ) ) {
+      foreach ( $extraHeaders as $key => $value ) {
+        if ( is_array( $headers ) ) {
+          $headers[$key] = $value;
+        }
+        else {
+          $headers .= "$key: $value\r\n";
+        }
+      }
     }
 
     $url = 'https://api.openai.com/v1' . $url;
@@ -845,30 +971,34 @@ class Meow_MWAI_Engines_OpenAI
       }
       $response = wp_remote_retrieve_body( $response );
       $data = $json ? json_decode( $response, true ) : $response;
-      $this->handleResponseErrors( $data );
+      $this->handle_response_errors( $data );
       return $data;
     }
     catch ( Exception $e ) {
       error_log( $e->getMessage() );
-      throw new Exception( $e->getMessage() . " (OpenAI)" );
+      throw new Exception( 'From OpenAI: ' . $e->getMessage() );
     }
   }
 
-  static public function get_openai_models() {
+  public function get_models() {
     return apply_filters( 'mwai_openai_models', MWAI_OPENAI_MODELS );
   }
 
-  private function calculatePrice( $modelFamily, $inUnits, $outUnits, $option = null, $finetune = false )
+  static public function get_models_static() {
+    return MWAI_OPENAI_MODELS;
+  }
+
+  private function calculate_price( $modelFamily, $inUnits, $outUnits, $option = null, $finetune = false )
   {
     // For fine-tuned models:
-    $potentialBaseModel = SELF::getBaseModelForFinetune( $modelFamily );
+    $potentialBaseModel = SELF::get_finetune_base_model( $modelFamily );
     if ( !empty( $potentialBaseModel ) ) {
       $modelFamily = $potentialBaseModel;
       $finetune = true;
     }
 
-    $openai_models = Meow_MWAI_Engines_OpenAI::get_openai_models();
-    foreach ( $openai_models as $currentModel ) {
+    $models = $this->get_models();
+    foreach ( $models as $currentModel ) {
       if ( $currentModel['model'] === $modelFamily || ( $finetune && $currentModel['family'] === $modelFamily ) ) {
         if ( $currentModel['type'] === 'image' ) {
           if ( !$option ) {
@@ -912,41 +1042,41 @@ class Meow_MWAI_Engines_OpenAI
     return null;
   }
 
-  public function getPrice( Meow_MWAI_Query_Base $query, Meow_MWAI_Reply $reply )
+  public function get_price( Meow_MWAI_Query_Base $query, Meow_MWAI_Reply $reply )
   {
     $model = $query->model;
     $units = 0;
     $option = null;
 
     $finetune = false;
-    if ( is_a( $query, 'Meow_MWAI_Query_Text' ) ) {
+    if ( is_a( $query, 'Meow_MWAI_Query_Text' ) || is_a( $query, 'Meow_MWAI_Query_Assistant' ) ) {
       if ( preg_match('/^([a-zA-Z]{0,32}):/', $model, $matches ) ) {
         $finetune = true;
       }
-      $inUnits = $reply->getPromptTokens();
-      $outUnits = $reply->getCompletionTokens();
-      return $this->calculatePrice( $model, $inUnits, $outUnits, $option, $finetune );
+      $inUnits = $reply->get_in_tokens( $query );
+      $outUnits = $reply->get_out_tokens();
+      return $this->calculate_price( $model, $inUnits, $outUnits, $option, $finetune );
     }
     else if ( is_a( $query, 'Meow_MWAI_Query_Image' ) ) {
-      $model = 'dall-e';
+      /** @var Meow_MWAI_Query_Image $query */
       $units = $query->maxResults;
-      $option = "1024x1024";
-      return $this->calculatePrice( $model, 0, $units, $option, $finetune );
+      $option = $query->resolution;
+      return $this->calculate_price( $model, 0, $units, $option, $finetune );
     }
     else if ( is_a( $query, 'Meow_MWAI_Query_Transcribe' ) ) {
       $model = 'whisper';
-      $units = $reply->getUnits();
-      return $this->calculatePrice( $model, 0, $units, $option, $finetune );
+      $units = $reply->get_units();
+      return $this->calculate_price( $model, 0, $units, $option, $finetune );
     }
     else if ( is_a( $query, 'Meow_MWAI_Query_Embed' ) ) {
-      $units = $reply->getTotalTokens();
-      return $this->calculatePrice( $model, 0, $units, $option, $finetune );
+      $units = $reply->get_total_tokens();
+      return $this->calculate_price( $model, 0, $units, $option, $finetune );
     }
     error_log("AI Engine: Cannot calculate price for $model.");
     return null;
   }
 
-  public function getIncidents() {
+  public function get_incidents() {
     $url = 'https://status.openai.com/history.rss';
     $response = wp_remote_get( $url );
     if ( is_wp_error( $response ) ) {

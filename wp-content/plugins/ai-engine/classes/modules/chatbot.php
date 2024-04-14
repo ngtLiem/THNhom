@@ -3,14 +3,15 @@
 // Params for the chatbot (front and server)
 
 define( 'MWAI_CHATBOT_FRONT_PARAMS', [ 'id', 'customId', 'aiName', 'userName', 'guestName',
-	'textSend', 'textClear', 
+	'textSend', 'textClear', 'imageUpload', 'fileUpload',
 	'textInputPlaceholder', 'textInputMaxLength', 'textCompliance', 'startSentence', 'localMemory',
 	'themeId', 'window', 'icon', 'iconText', 'iconAlt', 'iconPosition', 'fullscreen', 'copyButton'
 ] );
-define( 'MWAI_CHATBOT_SERVER_PARAMS', [ 'id', 'envId', 'env', 'mode', 'contentAware', 'context',
-	'embeddingsEnvId', 'embeddingsIndex', 'embeddingsNamespace',
-	'casuallyFineTuned', 'promptEnding', 'completionEnding', 'model', 'temperature', 'maxTokens',
-	'maxResults', 'apiKey', 'service'
+// TODO: Actually, 'env' is being replaced by 'scope', so we need to really remove it from here
+// after, February 2024.
+define( 'MWAI_CHATBOT_SERVER_PARAMS', [ 'id', 'envId', 'env', 'scope', 'mode', 'contentAware', 'context',
+	'embeddingsEnvId', 'embeddingsIndex', 'embeddingsNamespace', 'assistantId',
+	'model', 'temperature', 'maxTokens', 'contextMaxLength', 'maxResults', 'apiKey'
 ] );
 
 // Params for the discussions (front and server)
@@ -58,10 +59,9 @@ class Meow_MWAI_Modules_Chatbot {
 	public function rest_api_init() {
 		register_rest_route( $this->namespace, '/chats/submit', array(
 			'methods' => 'POST',
-			'callback' => array( $this, 'rest_chat' ),
-			'permission_callback' => '__return_true'
+			'callback' => [ $this, 'rest_chat' ],
+			'permission_callback' => array( $this->core, 'check_rest_nonce' )
 		) );
-		
 	}
 
 	public function basics_security_check( $botId, $customId, $newMessage ) {
@@ -88,6 +88,7 @@ class Meow_MWAI_Modules_Chatbot {
 		$customId = $params['customId'] ?? null;
 		$stream = $params['stream'] ?? false;
 		$newMessage = trim( $params['newMessage'] ?? '' );
+		$newFileId = $params['newFileId'] ?? null;
 
 		if ( !$this->basics_security_check( $botId, $customId, $newMessage )) {
 			return new WP_REST_Response( [ 
@@ -97,7 +98,7 @@ class Meow_MWAI_Modules_Chatbot {
 		}
 
 		try {
-			$data = $this->chat_submit( $botId, $newMessage, $params, $stream );
+			$data = $this->chat_submit( $botId, $newMessage, $newFileId, $params, $stream );
 			return new WP_REST_Response( [
 				'success' => true,
 				'reply' => $data['reply'],
@@ -114,7 +115,7 @@ class Meow_MWAI_Modules_Chatbot {
 		}
 	}
 
-	public function chat_submit( $botId, $newMessage, $params = [], $stream = false ) {
+	public function chat_submit( $botId, $newMessage, $newFileId = null, $params = [], $stream = false ) {
 		try {
 			$chatbot = null;
 			$customId = $params['customId'] ?? null;
@@ -125,11 +126,16 @@ class Meow_MWAI_Modules_Chatbot {
 			}
 			// Registered Chatbot
 			if ( !$chatbot && $botId ) {
-				$chatbot = $this->core->getChatbot( $botId );
+				$chatbot = $this->core->get_chatbot( $botId );
 			}
 
 			if ( !$chatbot ) {
 				error_log("AI Engine: No chatbot was found for this query.");
+				throw new Exception( 'Sorry, your query has been rejected.' );
+			}
+
+			$textInputMaxLength = $chatbot['textInputMaxLength'] ?? null;
+			if ( $textInputMaxLength && strlen( $newMessage ) > (int)$textInputMaxLength ) {
 				throw new Exception( 'Sorry, your query has been rejected.' );
 			}
 			
@@ -149,11 +155,12 @@ class Meow_MWAI_Modules_Chatbot {
 					$newParams[$key] = $value;
 				}
 				$params = apply_filters( 'mwai_chatbot_params', $newParams );
-				$params['env'] = empty( $params['env'] ) ? 'chatbot' : $params['env'];
-				$query->injectParams( $params );
+				$params['scope'] = empty( $params['scope'] ) ? 'chatbot' : $params['scope'];
+				$query->inject_params( $params );
 			}
 			else {
-				$query = new Meow_MWAI_Query_Text( $newMessage, 1024 );
+				$query = $mode === 'assistant' ? new Meow_MWAI_Query_Assistant( $newMessage ) : 
+					new Meow_MWAI_Query_Text( $newMessage, 1024 );
 				$streamCallback = null;
 
 				// Handle Params
@@ -165,8 +172,50 @@ class Meow_MWAI_Modules_Chatbot {
 					$newParams[$key] = $value;
 				}
 				$params = apply_filters( 'mwai_chatbot_params', $newParams );
-				$params['env'] = empty( $params['env'] ) ? 'chatbot' : $params['env'];
-				$query->injectParams( $params );
+				$params['scope'] = empty( $params['scope'] ) ? 'chatbot' : $params['scope'];
+				$query->inject_params( $params );
+
+				// Support for Uploaded Image
+				if ( !empty( $newFileId ) ) {
+
+					if ( $mode === 'assistant' ) {
+						// This is for Assistant
+						$url = $this->core->files->get_path( $newFileId );
+						$data = $this->core->files->get_data( $newFileId );
+						$openai = Meow_MWAI_Engines_Factory::get_openai( $this->core, $query->envId );
+						$filename = basename( $url );
+						$file = $openai->upload_file( $filename, $data, 'assistants' );
+						$openAiRefId = $file['id'];
+						$internalFileId = $this->core->files->get_id_from_refId( $newFileId );
+        		$this->core->files->update_refId( $internalFileId, $openAiRefId );
+						$this->core->files->update_envId( $internalFileId, $query->envId );
+						$newFileId = $openAiRefId;
+						$scope = $params['fileUpload'];
+						if ( $scope === 'discussion' || $scope === 'user' || $scope === 'assistant' ) {
+							$id = $this->core->files->get_id_from_refId( $newFileId );
+							$this->core->files->add_metadata( $id, 'assistant_scope', $scope );
+						}
+						$query->set_file( $openAiRefId, 'refId', 'assistant-in' );
+					}
+					else {
+						// This is for Vision AI
+						$remote_upload = $this->core->get_option( 'image_remote_upload' );
+						if ( $remote_upload === 'data' ) {
+							$data = $this->core->files->get_base64_data( $newFileId );
+							$mimeType = $this->core->files->get_mime_type( $newFileId );
+							$query->set_file( $data, 'data', 'vision', $mimeType );
+						}
+						else {
+							$url = $this->core->files->get_url( $newFileId );
+							$mimeType = $this->core->files->get_mime_type( $newFileId );
+							$query->set_file( $url, 'url', 'vision', $mimeType );
+						}
+						$fileId = $this->core->files->get_id_from_refId( $newFileId );
+						$this->core->files->update_envId( $fileId, $query->envId );
+						$this->core->files->add_metadata( $fileId, 'query_envId', $query->envId );
+						$this->core->files->add_metadata( $fileId, 'query_session', $query->session );
+					}
+				}
 
 				// Takeover
 				$takeoverAnswer = apply_filters( 'mwai_chatbot_takeover', null, $query, $params );
@@ -181,39 +230,22 @@ class Meow_MWAI_Modules_Chatbot {
 				// Moderation
 				if ( $this->core->get_option( 'shortcode_chat_moderation' ) ) {
 					global $mwai;
-					$isFlagged = $mwai->moderationCheck( $query->prompt );
+					$isFlagged = $mwai->moderationCheck( $query->get_message() );
 					if ( $isFlagged ) {
 						throw new Exception( 'Sorry, your message has been rejected by moderation.' );
 					}
 				}
 
 				// Awareness & Embeddings
-				// TODO: This is same in Chatbot Legacy and Forms, maybe we should move it to the core?
-				$embeddingsEnvId = $params['embeddingsEnvId'] ?? null;
-				$embeddingsIndex = $params['embeddingsIndex'] ?? null;
-				$embeddingsNamespace = $params['embeddingsNamespace'] ?? null;
-				if ( $query->mode === 'chat' ) {
-					$context = apply_filters( 'mwai_context_search', $context, $query, [ 
-						'embeddingsEnvId' => $embeddingsEnvId,
-						'embeddingsIndex' => $embeddingsIndex,
-						'embeddingsNamespace' => $embeddingsNamespace
-					] );
-					if ( !empty( $context ) ) {
-						if ( isset( $context['content'] ) ) {
-							$content = $this->core->cleanSentences( $context['content'] );
-							$query->injectContext( $content );
-						}
-						else {
-							error_log( "AI Engine: A context without content was returned." );
-						}
-					}
+					$context = $this->core->retrieve_context( $params, $query );
+				if ( !empty( $context ) ) {
+					$query->set_context( $context['content'] );
 				}
 			}
 
 			// Process Query
 			if ( $stream ) { 
 				$streamCallback = function( $reply ) {
-					//$raw = _wp_specialchars( $reply, ENT_NOQUOTES, 'UTF-8', true );
 					$raw = $reply;
 					$this->stream_push( [ 'type' => 'live', 'data' => $raw ] );
 					if (  ob_get_level() > 0 ) {
@@ -223,27 +255,23 @@ class Meow_MWAI_Modules_Chatbot {
 				};
 				header( 'Cache-Control: no-cache' );
 				header( 'Content-Type: text/event-stream' );
-				header( 'X-Accel-Buffering: no' ); // This is useful to disable buffering in nginx through headers.
+				// This is useful to disable buffering in nginx through headers.
+				header( 'X-Accel-Buffering: no' );
 				ob_implicit_flush( true );
 				ob_end_flush();
 			}
 
-			$reply = $this->core->ai->run( $query, $streamCallback );
+			$reply = $this->core->run_query( $query, $streamCallback, true );
 			$rawText = $reply->result;
 			$extra = [];
 			if ( $context ) {
 				$extra = [ 'embeddings' => $context['embeddings'] ];
 			}
-
 			$rawText = apply_filters( 'mwai_chatbot_reply', $rawText, $query, $params, $extra );
-			// TODO: There is no need for the shortcode_chat_formatting sice Markdown is handled on the client side.
-			// if ( $this->core->get_option( 'shortcode_chat_formatting' ) ) {
-			// 	$html = $this->core->markdown_to_html( $rawText );
-			// }
 
 			$restRes = [
 				'reply' => $rawText,
-				'images' => $reply->getType() === 'images' ? $reply->results : null,
+				'images' => $reply->get_type() === 'images' ? $reply->results : null,
 				'usage' => $reply->usage
 			];
 
@@ -288,12 +316,12 @@ class Meow_MWAI_Modules_Chatbot {
 	}
 
 	public function inject_chat() {
-		$params = $this->core->getChatbot( $this->siteWideChatId );
-		$cleanParams = [];
+		$params = $this->core->get_chatbot( $this->siteWideChatId );
+		$clean_params = [];
 		if ( !empty( $params ) ) {
-			$cleanParams['window'] = true;
-			$cleanParams['id'] = $this->siteWideChatId;
-			echo $this->chat_shortcode( $cleanParams );
+			$clean_params['window'] = true;
+			$clean_params['id'] = $this->siteWideChatId;
+			echo $this->chat_shortcode( $clean_params );
 		}
 		return null;
 	}
@@ -302,12 +330,12 @@ class Meow_MWAI_Modules_Chatbot {
 		$frontSystem = [
 			'botId' => $customId ? null : $botId,
 			'customId' => $customId,
-			'userData' => $this->core->getUserData(),
+			'userData' => $this->core->get_user_data(),
 			'sessionId' => $this->core->get_session_id(),
 			'restNonce' => $this->core->get_nonce(),
 			'contextId' => get_the_ID(),
 			'pluginUrl' => MWAI_URL,
-			'restUrl' => untrailingslashit( rest_url() ),
+			'restUrl' => untrailingslashit( get_rest_url() ),
 			'debugMode' => $this->core->get_option( 'debug_mode' ),
 			'typewriter' => $this->core->get_option( 'shortcode_chat_typewriter' ),
 			'speech_recognition' => $this->core->get_option( 'speech_recognition' ),
@@ -326,7 +354,7 @@ class Meow_MWAI_Modules_Chatbot {
       $botId = "default";
     }
     if ( $botId ) {
-      $chatbot = $this->core->getChatbot( $botId );
+      $chatbot = $this->core->get_chatbot( $botId );
       if (!$chatbot) {
         $botId = $botId ?: 'N/A';
         return [
@@ -334,7 +362,7 @@ class Meow_MWAI_Modules_Chatbot {
         ];
       }
     }
-    $chatbot = $chatbot ?: $this->core->getChatbot( 'default' );
+    $chatbot = $chatbot ?: $this->core->get_chatbot( 'default' );
     if ( !empty( $customId ) ) {
       $botId = null;
     }
@@ -406,9 +434,9 @@ class Meow_MWAI_Modules_Chatbot {
 		$frontSystem = $this->build_front_params( $botId, $customId );
 
 		// Clean Params
-		$frontParams = $this->cleanParams( $frontParams );
-		$frontSystem = $this->cleanParams( $frontSystem );
-		$serverParams = $this->cleanParams( $serverParams );
+		$frontParams = $this->clean_params( $frontParams );
+		$frontSystem = $this->clean_params( $frontSystem );
+		$serverParams = $this->clean_params( $serverParams );
 
 		// Server-side: Keep the System Params
 		if ( $hasServerOverrides ) {
@@ -420,7 +448,7 @@ class Meow_MWAI_Modules_Chatbot {
 		}
 
 		// Client-side: Prepare JSON for Front Params and System Params
-		$theme = isset( $frontParams['themeId'] ) ? $this->core->getTheme( $frontParams['themeId'] ) : null;
+		$theme = isset( $frontParams['themeId'] ) ? $this->core->get_theme( $frontParams['themeId'] ) : null;
 		$jsonFrontParams = htmlspecialchars( json_encode( $frontParams ), ENT_QUOTES, 'UTF-8' );
 		$jsonFrontSystem = htmlspecialchars( json_encode( $frontSystem ), ENT_QUOTES, 'UTF-8' );
 		$jsonFrontTheme = htmlspecialchars( json_encode( $theme ), ENT_QUOTES, 'UTF-8' );
@@ -475,11 +503,11 @@ class Meow_MWAI_Modules_Chatbot {
 		$frontSystem = $this->build_front_params( $botId, $customId );
 
     // Clean Params
-		$frontParams = $this->cleanParams( $frontParams );
-		$frontSystem = $this->cleanParams( $frontSystem );
-		$serverParams = $this->cleanParams( $serverParams );
+		$frontParams = $this->clean_params( $frontParams );
+		$frontSystem = $this->clean_params( $frontSystem );
+		$serverParams = $this->clean_params( $serverParams );
 
-    $theme = isset( $frontParams['themeId'] ) ? $this->core->getTheme( $frontParams['themeId'] ) : null;
+    $theme = isset( $frontParams['themeId'] ) ? $this->core->get_theme( $frontParams['themeId'] ) : null;
 		$jsonFrontParams = htmlspecialchars( json_encode( $frontParams ), ENT_QUOTES, 'UTF-8' );
 		$jsonFrontSystem = htmlspecialchars( json_encode( $frontSystem ), ENT_QUOTES, 'UTF-8' );
 		$jsonFrontTheme = htmlspecialchars( json_encode( $theme ), ENT_QUOTES, 'UTF-8' );
@@ -487,7 +515,7 @@ class Meow_MWAI_Modules_Chatbot {
     return "<div class='mwai-discussions-container' data-params='{$jsonFrontParams}' data-system='{$jsonFrontSystem}' data-theme='{$jsonFrontTheme}'></div>";
   }
 
-	function cleanParams( &$params ) {
+	function clean_params( &$params ) {
 		foreach ( $params as $param => $value ) {
 			if ( empty( $value ) || is_array( $value ) ) {
 				continue;

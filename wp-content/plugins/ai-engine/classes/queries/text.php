@@ -1,310 +1,144 @@
 <?php
 
 class Meow_MWAI_Query_Text extends Meow_MWAI_Query_Base implements JsonSerializable {
-  public int $maxTokens = 1024;
+
+  // Core Content
+  public ?string $file = null;
+  public ?string $fileType = null; // refId, url, data
+  public ?string $mimeType = 'image/jpeg';
+  public ?string $filePurpose = null; // assistant, vision
+
+  // Parameters
   public float $temperature = 0.8;
-  public int $maxSentences = 15;
+  public int $maxTokens = 1024;
   public ?string $stop = null;
-  public array $messages = [];
-  public ?string $context = null;
-  public ?string $newMessage = null;
-  public ?string $promptEnding = null;
-  public bool $casuallyFineTuned = false;
-  public ?int $promptTokens = null;
+  public ?string $responseFormat = null;
   
-  public function __construct( ?string $prompt = '', int $maxTokens = 1024, string $model = MWAI_FALLBACK_MODEL ) {
-    parent::__construct( $prompt );
-    $this->setModel( $model );
-    $this->setMaxTokens( $maxTokens );
+  #region Constructors, Serialization
+
+  public function __construct( ?string $message = '', ?int $maxTokens = null, string $model = null ) {
+    parent::__construct( $message );
+    if ( !empty( $model ) ) {
+      $this->set_model( $model );
+    }
+    if ( !empty( $maxTokens ) ) {
+      $this->set_max_tokens( $maxTokens );
+    }
   }
 
   #[\ReturnTypeWillChange]
   public function jsonSerialize() {
-    return [
-      'class' => get_class( $this ),
-      'prompt' => $this->prompt,
-      'messages' => $this->messages,
-      'maxTokens' => $this->maxTokens,
-      'temperature' => $this->temperature,
-      'maxSentences' => $this->maxSentences,
-      'context' => $this->context,
-      'newMessage' => $this->newMessage,
-      'model' => $this->model,
-      'mode' => $this->mode,
-      'session' => $this->session,
-      'env' => $this->env,
-      'envId' => $this->envId,
-      'service' => $this->service,
-      'promptEnding' => $this->promptEnding,
-      'stop' => $this->stop,
-      'casuallyFineTuned' => $this->casuallyFineTuned,
+    $json = [
+      //'instructions' => $this->instructions,
+      'message' => $this->message,
+
+      // 'context' => [
+      //   'messages' => $this->messages
+      // ],
+
+      'ai' => [
+        'model' => $this->model,
+        'maxTokens' => $this->maxTokens,
+        'temperature' => $this->temperature,
+      ],
+
+      'system' => [
+        'class' => get_class( $this ),
+        'envId' => $this->envId,
+        'mode' => $this->mode,
+        'scope' => $this->scope,
+        'session' => $this->session,
+        'maxMessages' => $this->maxMessages,
+      ]
     ];
-  }
 
-  public function getPromptTokens( $refresh = false ): int {
-    if ( $this->promptTokens && !$refresh ) {
-      return $this->promptTokens;
-    }
-    $this->promptTokens = $this->estimateTokens( $this->messages );
-    return $this->promptTokens;
-  }
-
-  public function getLastPrompt(): string {
-    if ( empty( $this->messages ) ) {
-      return $this->prompt;
-    }
-    $lastMessage = end( $this->messages );
-    return $lastMessage['content'];
-  }
-
-  // Quick and dirty token estimation
-  // Let's keep this synchronized with Helpers in JS
-  function estimateTokens( $content ): int
-  {
-    $text = "";
-    // https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
-    if ( is_array( $content ) ) {
-      foreach ( $content as $message ) {
-        $role = $message['role'];
-        $content = $message['content'];
-        $text .= "=#=$role\n$content=#=\n";
-      }
-    }
-    else {
-      $text = $content;
-    }
-    $tokens = 0;
-    return apply_filters( 'mwai_estimate_tokens', (int)$tokens, $text, $this->model );
-  }
-
-  /**
-   * Make sure the maxTokens is not greater than the model's context length.
-   */
-  public function finalChecks() {
-    if ( empty( $this->model )  ) { return; }
-
-    // Make sure the number of messages is not too great
-    if ( !empty( $this->maxSentences ) ) {
-      $context = array_shift( $this->messages );
-      if ( !empty( $this->messages ) ) {
-        $this->messages = array_slice( $this->messages, -$this->maxSentences );
-      }
-      else {
-        $this->messages = [];
-      }
-      if ( !empty( $context ) ) {
-        array_unshift( $this->messages, $context );
-      }
-    }
-
-    // Make sure the max tokens are respected.
-    $realMax = 4096;
-    $finetuneFamily = preg_match('/^([a-zA-Z]{0,32}):/', $this->model, $matches );
-    $finetuneFamily = ( isset( $matches ) && count( $matches ) > 0 ) ? $matches[1] : 'N/A';
-    $foundModel = null;
-    $openai_models = Meow_MWAI_Engines_OpenAI::get_openai_models();
-    foreach ( $openai_models as $currentModel ) {
-      if ( $currentModel['model'] === $this->model || $currentModel['family'] === $finetuneFamily ) {
-        $foundModel = $currentModel['name'];
-        $realMax = $currentModel['maxTokens'];
-        break;
-      }
-    }
-    $estimatedTokens = $this->getPromptTokens();
-    if ( !empty( $realMax ) && $estimatedTokens > $realMax ) {
-      throw new Exception( "AI Engine: The prompt is too long! It contains about $estimatedTokens tokens (estimation). The $foundModel model only accepts a maximum of $realMax tokens. " );
-    }
-    $realMax = (int)($realMax - $estimatedTokens) - 16;
-    if ( $this->maxTokens > $realMax ) {
-      $this->maxTokens = $realMax;
-    }
-  }
-
-  /**
-   * ID of the model to use.
-   * @param string $model ID of the model to use.
-   */
-  public function setModel( string $model ) {
-    $this->model = $model;
-    $this->mode = 'completion';
-    $found = false;
-    $openai_models = Meow_MWAI_Engines_OpenAI::get_openai_models();
-    foreach ( $openai_models as $currentModel ) {
-      if ( $currentModel['model'] === $this->model ) {
-        if ( $currentModel['mode'] ) {
-          $this->mode = $currentModel['mode'];
-        }
-        $found = true;
-        break;
-      }
-    }
-    if ( !$found ) {
-      // If the model can't be found, it's because it's probably a fine-tuned model. In the past (before August 2023),
-      // fine-tuned models were always based on GPT-3 (and therefore, using completion mode). From now on, they can be
-      // based on GPT-3.5 or 4 (and therefore, using chat mode). We need to detect that.
-      $baseModel = Meow_MWAI_Engines_OpenAI::getBaseModelForFinetune( $model );
-      if ( preg_match( '/^gpt-3.5|^gpt-4/', $baseModel ) ) {
-        $this->mode = 'chat';
-      }
-    }
-  }
-
-  /**
-   * Given a prompt, the model will return one or more predicted completions.
-   * It can also return the probabilities of alternative tokens at each position.
-   * @param string $prompt The prompt to generate completions.
-   */
-  public function setPrompt( $prompt ) {
-    parent::setPrompt( $prompt );
-    $this->validateMessages();
-  }
-
-  /**
-   * The prompt is used by models who uses Text Completion (and not Chat Completion).
-   * This returns the prompt if it's not a chat, otherwise it will build a prompt with
-   * all the messages nicely formatted.
-   */
-  public function getPrompt(): ?string {
-    // In the case it's really just a prompt.
-    if ( count( $this->messages ) === 1 ) {
-      $first = reset( $this->messages );
-      return $first['content'];
-    }
-    
-    // In the case it's a chat that we need to convert into a prompt.
-    $first = reset( $this->messages );
-    $prompt = "";
-    if ( $first && $first['role'] === 'system' ) {
-      $prompt = $first['content'] . "\n\n";
-    }
-
-    // Casually Fine-Tuned or Prompt-Ending
-    if ( !empty( $this->promptEnding ) ) {
-      $last = end( $this->messages );
-      if ( $last && $last['role'] === 'user' ) {
-        $prompt = $last['content'] . $this->promptEnding;
-      }
-      return $prompt;
-    }
-
-    // Standard Completion
-    while ( $message = next( $this->messages ) ) {
-      $role = $message['role'];
-      $content = $message['content'];
-      if ( $role === 'system' ) {
-        $prompt .= "$content\n\n";
-      }
-      if ( $role === 'user' ) {
-        $prompt .= "User: $content\n";
-      }
-      if ( $role === 'assistant' ) {
-        $prompt .= "AI: $content\n";
-      }
-    }
-    $prompt .= "AI: ";
-    return $prompt;
-  }
-
-  /**
-   * Similar to the prompt, but focus on the new/last message.
-   * Only used when the model has a chat mode (and only used in messages).
-   * @param string $prompt The messages to generate completions.
-   */
-  public function setNewMessage( string $newMessage ): void {
-    $this->newMessage = $newMessage;
-    $this->validateMessages();
-  }
-
-  public function replace( $search, $replace ) {
-    $this->prompt = str_replace( $search, $replace, $this->prompt );
-    $this->validateMessages();
-  }
-
-  /**
-   * Similar to the prompt, but use an array of messages instead.
-   * @param string $prompt The messages to generate completions.
-   */
-  public function setMessages( array $messages ) {
-    $messages = array_map( function( $message ) {
-      if ( is_array( $message ) ) {
-        return [ 'role' => $message['role'], 'content' => $message['content'] ];
-      }
-      else if ( is_object( $message ) ) {
-        return [ 'role' => $message->role, 'content' => $message->content ];
-      }
-      else {
-        throw new InvalidArgumentException( 'Unsupported message type.' );
-      }
-    }, $messages );
-    $this->messages = $messages;
-    $this->validateMessages();
-  }
-
-  public function getLastMessage(): ?string {
-    if ( !empty( $this->messages ) ) {
-      $lastMessageIndex = count( $this->messages ) - 1;
-      $lastMessage = $this->messages[$lastMessageIndex];
-      return $lastMessage['content'];
-    }
-    return null;
-  }
-
-  // Function that adds a message just before the last message
-  public function injectContext( string $content ): void {
-    if ( !empty( $this->messages ) ) {
-      $lastMessageIndex = count( $this->messages ) - 1;
-      $lastMessage = $this->messages[$lastMessageIndex];
-      $this->messages[$lastMessageIndex] = [ 'role' => 'system', 'content' => $content ];
-      array_push( $this->messages, $lastMessage );
-    }
-    $this->validateMessages();
-  }
-
-  /**
-   * The context that is used for the chat completion (mode === 'chat').
-   * @param string $context The context to use.
-   */
-  public function setContext( string $context ): void {
-    $this->context = apply_filters( 'mwai_ai_context', $context, $this );
-    $this->validateMessages();
-  }
-
-  private function validateMessages(): void {
-    // Messages should end with either the prompt or, if exists, the newMessage.
-    $message = empty( $this->newMessage ) ? $this->prompt : $this->newMessage;
-    if ( empty( $this->messages ) ) {
-      $this->messages = [ [ 'role' => 'user', 'content' => $message ] ];
-    }
-    else {
-      $last = &$this->messages[ count( $this->messages ) - 1 ];
-      if ( $last['role'] === 'user' ) {
-          $last['content'] = $message;
-      }
-      else {
-        array_push( $this->messages, [ 'role' => 'user', 'content' => $message ] );
-      }
-    }
-    
-    // The main context must be first.
     if ( !empty( $this->context ) ) {
-      if ( is_array( $this->messages ) && count( $this->messages ) > 0 ) {
-        if ( $this->messages[0]['role'] !== 'system' ) {
-          array_unshift( $this->messages, [ 'role' => 'system', 'content' => $this->context ] );
-        }
-        else {
-          $this->messages[0]['content'] = $this->context;
-        }
+      $json['context']['context'] = $this->context;
+    }
+
+    if ( !empty( $this->file ) ) {
+      $json['context']['hasFile'] = true;
+      if ( $this->fileType === 'url' ) {
+        $json['context']['fileUrl'] = $this->file;
       }
     }
+
+    return $json;
+  }
+
+  #endregion
+
+  #region File Handling
+
+  public function set_file( string $file, string $fileType = null,
+    string $filePurpose = null, string $mimeType = null ) : void {
+    if ( !empty( $fileType ) && $fileType !== 'refId' && $fileType !== 'url' && $fileType !== 'data' ) {
+      throw new Exception( "AI Engine: The file type can only be refId, url or data." );
+    }
+    if ( !empty( $filePurpose ) && $filePurpose !== 'assistant-in' && $filePurpose !== 'vision' ) {
+      throw new Exception( "AI Engine: The file purpose can only be assistant or vision." );
+    }
+    if ( !empty( $mimeType ) ) {
+      $this->mimeType = $mimeType;
+    }
+    $this->file = $file;
+    $this->fileType = $fileType;
+    $this->filePurpose = $filePurpose;
+  }
+
+  public function get_file_url() {
+    if ( $this->fileType === 'url' ) {
+      return $this->file;
+    }
+    else if ( $this->fileType === 'data' ) {
+      return "data:image/jpeg;base64,{$this->file}";
+    }
+    else if ( $this->fileType === 'refId' ) {
+      throw new Exception( "AI Engine: The file type refId is not supported yet." );
+    }
+    else {
+      return null;
+    }
+  }
+
+  // TODO: Those file-related methods should be checked and streaminled.
+  // It's used by OpenAI, OpenRouter and Anthropic.
+  public function get_file_data() {
+    if ( $this->fileType === 'url' ) {
+      $data = file_get_contents( $this->file );
+      return base64_encode( $data );
+    }
+    else if ( $this->fileType === 'data' ) {
+      return $this->file;
+    }
+  }
+
+  public function get_file_mime_type() {
+    return $this->mimeType;
+  }
+
+  #endregion
+
+  #region Parameters
+
+  /**
+   * The type of return expected from the API. It can be either null or "json".
+   * @param int $maxResults The maximum number of completions.
+   */
+  public function set_response_format( $responseFormat ) {
+    if ( !empty( $responseFormat ) && $responseFormat !== 'json' ) {
+      throw new Exception( "AI Engine: The response format can only be null or json." );
+    }
+    $this->responseFormat = $responseFormat;
   }
 
   /**
    * The maximum number of tokens to generate in the completion.
    * The token count of your prompt plus max_tokens cannot exceed the model's context length.
    * Most models have a context length of 2048 tokens (except for the newest models, which support 4096).
-   * @param float $prompt The maximum number of tokens.
+   * @param float $maxTokens The maximum number of tokens.
    */
-  public function setMaxTokens( int $maxTokens ): void {
+  public function set_max_tokens( int $maxTokens ): void {
     $this->maxTokens = $maxTokens;
   }
 
@@ -313,7 +147,7 @@ class Meow_MWAI_Query_Text extends Meow_MWAI_Query_Base implements JsonSerializa
    * Try 0.9 for more creative applications, and 0 for ones with a well-defined reply.
    * @param float $temperature The temperature.
    */
-  public function setTemperature( float $temperature ): void {
+  public function set_temperature( float $temperature ): void {
     $temperature = floatval( $temperature );
     if ( $temperature > 1 ) {
       $temperature = 1;
@@ -324,100 +158,33 @@ class Meow_MWAI_Query_Text extends Meow_MWAI_Query_Base implements JsonSerializa
     $this->temperature = round( $temperature, 2 );
   }
 
-  public function setMaxSentences( int $maxSentences ): void {
-    if ( !empty( $maxSentences ) ) {
-      $this->maxSentences = intval( $maxSentences );
-      $this->validateMessages();
-    }
-  }
-
-  public function setStop( string $stop ): void {
+  public function set_stop( string $stop ): void {
     $this->stop = $stop;
   }
 
-  private function convertKeys( $params )
-  {
-    $newParams = [];
-    foreach ( $params as $key => $value ) {
-      $newKey = '';
-      $capitalizeNextChar = false;
-      for ( $i = 0; $i < strlen( $key ); $i++ ) {
-        if ( $key[$i] == '_' ) {
-          $capitalizeNextChar = true;
-        }
-        else {
-          $newKey .= $capitalizeNextChar ? strtoupper($key[$i]) : $key[$i];
-          $capitalizeNextChar = false;
-        }
-      }
-      $newParams[$newKey] = $value;
-    }
-    return $newParams;
-  }
+  #endregion
+
+  #region Inject Params
 
   // Based on the params of the query, update the attributes
-  public function injectParams( array $params ): void
+  public function inject_params( array $params ): void
   {
-    // Those are for the keys passed directly by the shortcode.
-    $params = $this->convertKeys( $params );
+    parent::inject_params( $params );
+    $params = $this->convert_keys( $params );
 
-    $acceptedValues = [ true, 1, '1' ];
-    if ( !empty( $params['model'] ) ) {
-			$this->setModel( $params['model'] );
-		}
-    if ( !empty( $params['casuallyFineTuned'] ) && in_array( $params['casuallyFineTuned'], $acceptedValues, true ) ) {
-      $this->promptEnding = "\n\n###\n\n";
-      $this->stop = "\n\n";
-      $this->casuallyFineTuned = true;
-		}
-    if ( !empty( $params['prompt'] ) ) {
-      $this->setPrompt( $params['prompt'] );
-    }
-    if ( !empty( $params['context'] ) ) {
-      $this->setContext( $params['context'] );
-    }
-    if ( !empty( $params['messages'] ) ) {
-      $this->setMessages( $params['messages'] );
-    }
-    if ( !empty( $params['newMessage'] ) ) {
-      $this->setNewMessage( $params['newMessage'] );
-    }
     if ( !empty( $params['maxTokens'] ) && intval( $params['maxTokens'] ) > 0 ) {
-			$this->setMaxTokens( intval( $params['maxTokens'] ) );
+			$this->set_max_tokens( intval( $params['maxTokens'] ) );
 		}
-    if ( !empty( $params['maxMessages'] ) && intval( $params['maxMessages'] ) > 0 ) {
-      $this->setMaxSentences( intval( $params['maxMessages'] ) );
-    }
-    if ( !empty( $params['maxSentences'] ) && intval( $params['maxSentences'] ) > 0 ) {
-      $this->setMaxSentences( intval( $params['maxSentences'] ) );
-    }
-		if ( !empty( $params['temperature'] ) ) {
-			$this->setTemperature( $params['temperature'] );
+		if ( isset( $params['temperature'] ) && $params['temperature'] !== '' ) {
+			$this->set_temperature( $params['temperature'] );
 		}
 		if ( !empty( $params['stop'] ) ) {
-			$this->setStop( $params['stop'] );
+			$this->set_stop( $params['stop'] );
 		}
-    if ( !empty( $params['maxResults'] ) ) {
-			$this->setMaxResults( $params['maxResults'] );
-		}
-		if ( !empty( $params['env'] ) ) {
-			$this->setEnv( $params['env'] );
-		}
-		if ( !empty( $params['session'] ) ) {
-			$this->setSession( $params['session'] );
-		}
-    // Should add the params related to Open AI and Azure
-    if ( !empty( $params['service'] ) ) {
-			$this->setService( $params['service'] );
-		}
-    if ( !empty( $params['apiKey'] ) ) {
-			$this->setApiKey( $params['apiKey'] );
-		}
-    if ( !empty( $params['botId'] ) ) {
-      $this->setBotId( $params['botId'] );
-    }
-    if ( !empty( $params['envId'] ) ) {
-      $this->setEnvId( $params['envId'] );
+    if ( !empty( $params['responseFormat'] ) ) {
+      $this->set_response_format( $params['responseFormat'] );
     }
   }
+
+  #endregion
 }

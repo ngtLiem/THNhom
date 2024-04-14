@@ -1,10 +1,15 @@
 <?php
 
 class Meow_MWAI_Reply implements JsonSerializable {
-
+  public $id = null;
   public $result = '';
   public $results = [];
-  public $usage = [ 'prompt_tokens' => 0, 'completion_tokens' => 0, 'total_tokens' => 0 ];
+  public $usage = [ 
+    'prompt_tokens' => 0,
+    'completion_tokens' => 0,
+    'total_tokens' => 0,
+    'price' => null,
+  ];
   public $query = null;
   public $type = 'text';
 
@@ -18,38 +23,56 @@ class Meow_MWAI_Reply implements JsonSerializable {
   #[\ReturnTypeWillChange]
   public function jsonSerialize() {
     return [
-      'class' => get_class( $this ),
       'result' => $this->result,
       'results' => $this->results,
-      'usage' => $this->usage
+      'usage' => $this->usage,
+      'system' => [
+        'class' => get_class( $this ),
+      ]
     ];
   }
 
-  public function setQuery( $query ) {
-    $this->query = $query;
-  }
-
-  public function setUsage( $usage ) {
+  public function set_usage( $usage ) {
     $this->usage = $usage;
   }
 
-  public function setType( $type ) {
+  public function set_id( $id ) {
+    $this->id = $id;
+  }
+
+  public function set_type( $type ) {
     $this->type = $type;
   }
 
-  public function getTotalTokens() {
+  public function get_total_tokens() {
     return $this->usage['total_tokens'];
   }
 
-  public function getPromptTokens() {
-    return $this->usage['prompt_tokens'];
+  public function get_in_tokens( $query = null ) {
+    $in_tokens = $this->usage['prompt_tokens'];
+    if ( empty( $in_tokens ) && $query ) {
+      $in_tokens = $query->get_in_tokens();
+    }
+    return $in_tokens;
   }
 
-  public function getCompletionTokens() {
-    return $this->usage['completion_tokens'];
+  public function get_out_tokens() {
+    $out_tokens = $this->usage['completion_tokens'];
+    if ( empty( $out_tokens ) ) {
+      $out_tokens = Meow_MWAI_Core::estimate_tokens( $this->result );
+    }
+    return $out_tokens;
   }
 
-  public function getUnits() {
+  public function get_price() {
+    // If it's not set return null, but it can be 0
+    if ( !isset( $this->usage['price'] ) ) {
+      return null;
+    }
+    return $this->usage['price'];
+  }
+
+  public function get_units() {
     if ( isset( $this->usage['total_tokens'] ) ) {
       return $this->usage['total_tokens'];
     }
@@ -62,23 +85,11 @@ class Meow_MWAI_Reply implements JsonSerializable {
     return null;
   }
 
-  public function getResults() {
-    return $this->results;
-  }
-
-  public function getUsage() {
-    return $this->usage;
-  }
-
-  public function getResult() {
-    return $this->result;
-  }
-
-  public function getType() {
+  public function get_type() {
     return $this->type;
   }
 
-  public function setReply( $reply ) {
+  public function set_reply( $reply ) {
     $this->result = $reply;
     $this->results[] = [ $reply ];
   }
@@ -95,7 +106,7 @@ class Meow_MWAI_Reply implements JsonSerializable {
    * The last (or only) result is set as the result.
    * @param array $choices ID of the model to use.
    */
-  public function setChoices( $choices ) {
+  public function set_choices( $choices ) {
     $this->results = [];
     if ( is_array( $choices ) ) {
       foreach ( $choices as $choice ) {
@@ -124,9 +135,19 @@ class Meow_MWAI_Reply implements JsonSerializable {
 
         // It's text completion
         else if ( isset( $choice['text'] ) ) {
-          $text = trim( $choice['text'] );
-          $this->results[] = $text;
-          $this->result = $text;
+
+          // TODO: Assistants return an array (so actually not really a text completion)
+          // We should probably make this clearer and analyze all the outputs from different endpoints.
+          if ( is_array( $choice['text'] ) ) {
+            $text = trim( $choice['text']['value'] );
+            $this->results[] = $text;
+            $this->result = $text;
+          }
+          else {
+            $text = trim( $choice['text'] );
+            $this->results[] = $text;
+            $this->result = $text;
+          }
         }
 
         // It's url/image

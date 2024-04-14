@@ -2,7 +2,6 @@
 
 require_once( MWAI_PATH . '/constants/models.php' );
 
-// Thisi
 define( 'MWAI_CHATBOT_DEFAULT_PARAMS', [
 	// UI Parameters
 	'aiName' => "AI: ",
@@ -14,7 +13,6 @@ define( 'MWAI_CHATBOT_DEFAULT_PARAMS', [
 	'textInputMaxLength' => 512,
 	'textCompliance' => '',
 	'startSentence' => "Hi! How can I help you?",
-	'maxSentences' => 15,
 	'themeId' => 'chatgpt',
 	'window' => false,
 	'icon' => '',
@@ -31,61 +29,13 @@ define( 'MWAI_CHATBOT_DEFAULT_PARAMS', [
 	'mode' => 'chat',
 	'contentAware' => false,
 	'embeddingsEnvId' => '',
-	'embeddingsIndex' => '',
-	'embeddingsNamespace' => null,
-	'casuallyFineTuned' => false,
-	'promptEnding' => null,
-	'completionEnding' => null,
 	// AI Parameters
 	'model' => MWAI_FALLBACK_MODEL,
 	'temperature' => 0.8,
+	'maxMessages' => 15,
 	'maxTokens' => 1024,
 	'maxResults' => 1,
-	'apiKey' => null,
-	'service' => 'openai'
-] );
-
-// This is the defaults for the old chatbot (Vanilla JS)
-define( 'MWAI_CHATBOT_PARAMS', [
-	// UI Parameters
-	'id' => '',
-	'env' => 'chatbot',
-	'mode' => 'chat',
-	'context' => "Converse as if you were an AI assistant. Be friendly, creative.",
-	'ai_name' => "AI: ",
-	'user_name' => "User: ",
-	'guest_name' => "Guest: ",
-	'sys_name' => "System: ",
-	'start_sentence' => "Hi! How can I help you?",
-	'text_send' => 'Send',
-	'text_clear' => 'Clear',
-	'text_input_placeholder' => 'Type your message...',
-	'text_input_maxlength' => '512',
-	'text_compliance' => '',
-	'max_messages' => 15,
-	'style' => 'chatgpt', // This is only used in the old version of Chatbot
-	'themeId' => 'chatgpt',
-	'window' => false,
-	'icon' => '',
-	'icon_text' => '',
-	'icon_alt' => 'AI Chatbot Avatar',
-	'icon_position' => 'bottom-right',
-	'fullscreen' => false,
-	'copy_button' => false,
-	'local_memory' => true,
-	// Chatbot System Parameters
-	'casually_fine_tuned' => false,
-	'content_aware' => false,
-	'embeddings_index' => '',
-	'prompt_ending' => null,
-	'completion_ending' => null,
-	// AI Parameters
-	'model' => MWAI_FALLBACK_MODEL,
-	'temperature' => 0.8,
-	'max_tokens' => 1024,
-	'max_results' => 1,
-	'api_key' => null,
-	'service' => 'openai'
+	'apiKey' => null
 ] );
 
 define( 'MWAI_LANGUAGES', [
@@ -107,14 +57,14 @@ define ( 'MWAI_LIMITS', [
 		'creditType' => 'queries',
 		'timeFrame' => 'day',
 		'isAbsolute' => false,
-		'overLimitMessage' => "You have reached the limit.",
+		'overLimitMessage' => "You have reached the limit (check the Queries Tab > Limits > Guests).",
 	],
 	'users' => [
 		'credits' => 10,
 		'creditType' => 'price',
 		'timeFrame' => 'month',
 		'isAbsolute' => false,
-		'overLimitMessage' => "You have reached the limit.",
+		'overLimitMessage' => "You have reached the limit (check the Queries Tab > Limits > Users).",
 		'ignoredUsers' => "administrator,editor",
 	],
 	'system' => [
@@ -138,15 +88,9 @@ define( 'MWAI_OPTIONS', [
 	'module_moderation' => false,
 	'module_statistics' => false,
 	'module_finetunes' => false,
-	//'module_legacy_finetunes' => false,
 	'module_embeddings' => false,
-	'module_audio' => false,
+	'module_transcription' => false,
 	'shortcode_chat' => true,
-	'shortcode_chat_params' => MWAI_CHATBOT_PARAMS,
-	'shortcode_chat_params_override' => false,
-	'shortcode_chat_html' => true,
-	'shortcode_chat_formatting' => true,
-	'shortcode_chat_legacy' => false,
 	'shortcode_chat_stream' => false,
 	'shortcode_chat_typewriter' => false,
 	'speech_recognition' => false,
@@ -154,29 +98,20 @@ define( 'MWAI_OPTIONS', [
 	'shortcode_chat_discussions' => false,
 	'shortcode_chat_moderation' => false,
 	'shortcode_chat_syntax_highlighting' => false,
-	'shortcode_chat_inject' => false,
-	'shortcode_chat_styles' => [],
 	'limits' => MWAI_LIMITS,
 
 	// General Settings for OpenAI
 	'fallback_model' => MWAI_FALLBACK_MODEL,
-	'openai_models' => Meow_MWAI_Engines_OpenAI::get_openai_models(),
+	'openai_models' => null,
 	'openai_usage' => [],
 
-	// TODO: To Migrate (Azure)
-	'openai_azure_endpoint' => '',
-	'openai_azure_apikey' => '',
-	'openai_azure_deployments' => [],
+	// General Settings for Anthropic
+	'anthropic_models' => null,
 
-	// TODO: To Migrate (OpenAI)
-	'openai_apikey' => false,
-	'openai_finetunes' => [], // All finetunes listed by OpenAI
-	'openai_finetunes_deleted' => [], // The finetunes that have been deleted
-	'openai_legacy_finetunes' => [],
-	'openai_legacy_finetunes_deleted' => [],
-
-	// TODO: openai_service to ai_env_default
-	'openai_service' => 'openai', // 'openai', 'azure' (if not set here, it will use the Settings)
+	// Settings for Images
+	'image_local_upload' => 'uploads',
+	'image_remote_upload' => 'data',
+	'image_expires' => 1 * HOUR_IN_SECONDS,
 
 	'ai_default_env' => null,
 	'ai_default_model' => MWAI_FALLBACK_MODEL,
@@ -204,20 +139,15 @@ define( 'MWAI_OPTIONS', [
 			'name' => 'Pinecone',
 			'type' => 'pinecone',
 			'apikey' => '',
-			'server' => 'gcp-starter',
-			'indexes' => [],
-			'namespaces' => [],
-			'index' => null
+			'server' => ''
 		]
 	],
 	'embeddings' => [
 		'rewriteContent' => true,
 		'rewritePrompt' => "Rewrite the content concisely in {LANGUAGE}, maintaining the same style and information. The revised text should be under 800 words, with paragraphs ranging from 160-280 words each. Omit non-textual elements and avoid unnecessary repetition. Conclude with a statement directing readers to find more information at {URL}. If you cannot meet these requirements, please leave a blank response. The content is below, between '== START ==' and '== END =='.\n\n== START ==\n{CONTENT}\n== END ==\n\n",
 		'forceRecreate' => false,
-		'maxSelect' => 1,
-		'minScore' => 75,
 		'syncPosts' => false,
-		'syncPostsEnv' => null,
+		'syncPostsEnvId' => null,
 		'syncPostTypes' => ['post', 'page', 'product'],
 		'syncPostStatus' => ['publish'],
 	],
@@ -226,8 +156,7 @@ define( 'MWAI_OPTIONS', [
 	'debug_mode' => true,
 	'intro_message' => true,
 	'resolve_shortcodes' => false,
-	'dynamic_max_tokens' => true,
-	'context_max_tokens' => 1024,
+	'context_max_length' => 4096,
 	'banned_words' => [],
 	'banned_ips' => [],
 	'languages' => MWAI_LANGUAGES,

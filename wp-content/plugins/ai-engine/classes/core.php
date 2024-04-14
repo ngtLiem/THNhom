@@ -3,8 +3,6 @@
 require_once( MWAI_PATH . '/vendor/autoload.php' );
 require_once( MWAI_PATH . '/constants/init.php' );
 
-use Rahul900day\Gpt3Encoder\Encoder;
-
 define( 'MWAI_IMG_WAND', MWAI_URL . '/images/wand.png' );
 define( 'MWAI_IMG_WAND_HTML', "<img style='height: 22px; margin-bottom: -5px; margin-right: 8px;'
   src='" . MWAI_IMG_WAND . "' alt='AI Wand' />" );
@@ -17,21 +15,23 @@ class Meow_MWAI_Core
 	public $is_rest = false;
 	public $is_cli = false;
 	public $site_url = null;
-	public $ai = null;
+	public $files = null;
+	public $tasks = null;
 	private $option_name = 'mwai_options';
 	private $themes_option_name = 'mwai_themes';
 	private $chatbots_option_name = 'mwai_chatbots';
 	private $nonce = null;
-	public $defaultChatbotParams = MWAI_CHATBOT_PARAMS;
 
-	// Cached
-	private $options = null;
+	public $chatbot = null;
+	public $discussions = null;
 
 	public function __construct() {
 		$this->site_url = get_site_url();
 		$this->is_rest = MeowCommon_Helpers::is_rest();
 		$this->is_cli = defined( 'WP_CLI' );
-		$this->ai = new Meow_MWAI_Engines_Core( $this );
+		$this->files = new Meow_MWAI_Modules_Files( $this );
+		$this->tasks = new Meow_MWAI_Modules_Tasks( $this );
+
 		add_action( 'plugins_loaded', array( $this, 'init' ) );
 		add_action( 'wp_register_script', array( $this, 'register_scripts' ) );
 		add_action( 'wp_enqueue_scripts', array( $this, 'register_scripts' ) );
@@ -41,20 +41,19 @@ class Meow_MWAI_Core
 	#region Init & Scripts
 	function init() {
 		global $mwai;
-		$chatbot_module = null;
-		$discussions_module = null;
+		$this->chatbot = null;
+		$this->discussions = null;
 		new Meow_MWAI_Modules_Security( $this );
 		if ( $this->is_rest ) {
 			new Meow_MWAI_Rest( $this );
 		}
 		if ( is_admin() ) {
 			new Meow_MWAI_Admin( $this );
-			new Meow_MWAI_Modules_Assistants( $this );
+			new Meow_MWAI_Modules_Utilities( $this );
 		}
 		if ( $this->get_option( 'shortcode_chat' ) ) {
-			$chatbot_module = new Meow_MWAI_Modules_Chatbot();
-			$discussions_module = new Meow_MWAI_Modules_Discussions();
-			// new Meow_MWAI_Modules_Chatbot_Legacy();
+			$this->chatbot = new Meow_MWAI_Modules_Chatbot();
+			$this->discussions = new Meow_MWAI_Modules_Discussions();
 		}
 
 		// Advanced core
@@ -62,12 +61,7 @@ class Meow_MWAI_Core
 			new MeowPro_MWAI_Core( $this );
 		}
 
-		// Dynamic max tokens
-		if ( $this->get_option( 'dynamic_max_tokens' ) ) {
-			add_filter( 'mwai_estimate_tokens', array( $this, 'dynamic_max_tokens' ), 10, 2 );
-		}
-
-		$mwai = new Meow_MWAI_API( $chatbot_module, $discussions_module );
+		$mwai = new Meow_MWAI_API( $this->chatbot, $this->discussions );
 	}
 
 	public function register_scripts() {
@@ -99,10 +93,59 @@ class Meow_MWAI_Core
 
 	#endregion
 
+	#region AI-Related Helpers
+	function run_query( $query, $streamCallback = null, $markdown = false ) {
+		$envId = !empty( $query->envId ) ? $query->envId : null;
+		$engine = Meow_MWAI_Engines_Factory::get( $this, $envId );
+
+		// If the engine is not set, we need to set it to the default one.
+		if ( !$envId || !$engine->retrieve_model_info( $query->model ) ) {
+			if ( $query instanceof Meow_MWAI_Query_Text ) {
+				$this->set_if_empty_defaults( $query, 'ai_default_env', 'ai_default_model' );
+			}
+			if ( $query instanceof Meow_MWAI_Query_Embed ) {
+				$this->set_if_empty_defaults( $query, 'ai_embeddings_default_env', 'ai_embeddings_default_model' );
+			}
+			else if ( $query instanceof Meow_MWAI_Query_Image ) {
+				$this->set_if_empty_defaults( $query, 'ai_images_default_env', 'ai_images_default_model' );
+			}
+			else if ( $query instanceof Meow_MWAI_Query_Transcribe ) {
+				$this->set_if_empty_defaults( $query, 'ai_audio_default_env', 'ai_audio_default_model' );
+			}
+			$engine = Meow_MWAI_Engines_Factory::get( $this, $query->envId );
+		}
+
+		// Let's run the query.
+		$reply = $engine->run( $query, $streamCallback );
+		
+		// Let's allow to modify the reply before it is sent.
+		if ( $markdown ) {
+			if ( $query instanceof Meow_MWAI_Query_Image ) {
+				$reply->result = "";
+				foreach ( $reply->results as $result ) {
+					$reply->result .= "![Image]($result)\n";
+				}
+			}
+		}
+
+		return $reply;
+	}
+	
+	private function set_if_empty_defaults( $query, $envOption, $modelOption ) {
+		$defaultEnv = $this->get_option( $envOption );
+		$defaultModel = $this->get_option( $modelOption );
+		if ( empty( $defaultEnv ) || empty( $defaultModel ) ) {
+			throw new Exception( 'AI Engine: The default environment and model are not set.' );
+		}
+		$query->set_env_id( $defaultEnv );
+		$query->set_model( $defaultModel );
+	}	
+	#endregion
+
 	#region Text-Related Helpers
 
 	// Clean the text perfectly, resolve shortcodes, etc, etc.
-  function cleanText( $rawText = "" ) {
+  function clean_text( $rawText = "" ) {
 		$text = html_entity_decode( $rawText );
 		$text = wp_strip_all_tags( $text );
 		$text = preg_replace( '/[\r\n]+/', "\n", $text );
@@ -112,24 +155,23 @@ class Meow_MWAI_Core
   }
 
   // Make sure there are no duplicate sentences, and keep the length under a maximum length.
-  function cleanSentences( $text, $maxTokens = null ) {
-    //$sentences = preg_split( '/(?<=[.?!])(?=[a-zA-Z ])/', $text );
-		$maxTokens = $maxTokens ? $maxTokens : $this->get_option( 'context_max_tokens', 1024 );
+  function clean_sentences( $text, $maxLength = null ) {
+		$maxLength = (int)($maxLength ? $maxLength : $this->get_option( 'context_max_length', 4096 ));
 		$sentences = preg_split('/(?<=[.?!。．！？])+/u', $text);
     $hashes = array();
     $uniqueSentences = array();
-    $length = 0;
+    $total = 0;
     foreach ( $sentences as $sentence ) {
       $sentence = preg_replace( '/^[\pZ\pC]+|[\pZ\pC]+$/u', '', $sentence );
       $hash = md5( $sentence );
       if ( !in_array( $hash, $hashes ) ) {
-				$tokensCount = apply_filters( 'mwai_estimate_tokens', 0, $sentence );
-        if ( $length + $tokensCount > $maxTokens ) {
+				$length = strlen( $sentence );
+        if ( $total + $length > $maxLength ) {
           continue;
         }
         $hashes[] = $hash;
         $uniqueSentences[] = $sentence;
-        $length += $tokensCount;
+        $total += $length;
       }
     }
     $freshText = implode( " ", $uniqueSentences );
@@ -137,7 +179,7 @@ class Meow_MWAI_Core
     return $freshText;
   }
 
-	function getCleanPostContent( $postId ) {
+	function get_post_content( $postId ) {
 		$post = get_post( $postId );
 		if ( !$post ) {
 			return false;
@@ -154,8 +196,8 @@ class Meow_MWAI_Core
 			$pattern = "/<!--\s*\/?wp:[^\>]+-->/";
 			$text = preg_replace( $pattern, '', $text );
 		}
-		$text = $this->cleanText( $text );
-		$text = $this->cleanSentences( $text );
+		$text = $this->clean_text( $text );
+		$text = $this->clean_sentences( $text );
 		$text = apply_filters( 'mwai_post_content', $text, $postId );
 		return $text;
 	}
@@ -179,12 +221,151 @@ class Meow_MWAI_Core
 	}
 	#endregion
 
+ 	#region Image-Related Helpers
+	function get_mime_type( $file ) {
+		$mimeType = null;
+
+		// Let's try to use mime_content_type if the function exists
+		if ( function_exists( 'mime_content_type' ) ) {
+			$mimeType = mime_content_type( $file );
+		}
+
+		// Otherwise, let's check the file extension (which can actually also be an URL)
+		if ( !$mimeType ) {
+			$extension = pathinfo( $file, PATHINFO_EXTENSION );
+			$extension = strtolower( $extension );
+			$mimeTypes = [
+				'jpg' => 'image/jpeg',
+				'jpeg' => 'image/jpeg',
+				'png' => 'image/png',
+				'gif' => 'image/gif',
+				'webp' => 'image/webp',
+				'bmp' => 'image/bmp',
+				'tiff' => 'image/tiff',
+				'tif' => 'image/tiff',
+				'svg' => 'image/svg+xml',
+				'ico' => 'image/x-icon',
+				'pdf' => 'application/pdf',
+			];
+			$mimeType = isset( $mimeTypes[$extension] ) ? $mimeTypes[$extension] : null;
+		}
+
+		return $mimeType;
+	}
+
+	function download_image( $url ) {
+		$args = array( 'timeout' => 60, );
+		$response = wp_safe_remote_get( $url, $args );
+		if ( is_wp_error( $response ) ) {
+			throw new Exception( $response->get_error_message() );
+		}
+		$output = wp_remote_retrieve_body( $response );
+		if ( is_wp_error( $output ) ) {
+			throw new Exception( $output->get_error_message() );
+		}
+		return $output;
+	}
+
+	/**
+	 * Add an image from a URL to the Media Library.
+	 * @param string $url The URL of the image to be downloaded.
+	 * @param string $filename The filename of the image, if not set, it will be the basename of the URL.
+	 * @param string $title The title of the image.
+	 * @param string $description The description of the image.
+	 * @param string $caption The caption of the image.
+	 * @param string $alt The alt text of the image.
+	 * @return int The attachment ID of the image.
+	 */
+	public function add_image_from_url( $url, $filename = null, $title = null,
+		$description = null, $caption = null, $alt = null ) {
+		$path_parts = pathinfo( parse_url( $url, PHP_URL_PATH ) );
+		$url_filename = $path_parts['basename'];
+		$file_type = wp_check_filetype( $url_filename, null );
+		$allowed_types = get_allowed_mime_types();
+		if ( !$file_type || !in_array( $file_type['type'], $allowed_types ) ) {
+			throw new Exception( 'Invalid file type.' );
+		}
+		$extension = $file_type['ext'];
+		$image_data = $this->download_image( $url );
+		if ( !$image_data ) {
+			throw new Exception( 'Could not download the image.' );
+		}
+		$upload_dir = wp_upload_dir();
+
+		// If filename is not set or starts with 'generated_', we will generate a new filename.
+		if ( empty( $filename ) ) {
+			$filename = sanitize_file_name( $url_filename );
+			$extension = pathinfo( $filename, PATHINFO_EXTENSION );
+			if ( empty( $extension ) ) {
+				$extension = $file_type['ext'];
+			}
+			if ( strlen( $filename ) > 32 || strlen( $filename ) < 4 || strpos( $filename, 'generated_' ) === 0 ) {
+				$filename = $this->get_random_id( 16 ) . '.' . $extension;
+			}
+			if ( strpos( $filename, '.' ) === false ) {
+				$filename .= '.' . $extension;
+			}
+		}
+		if ( wp_mkdir_p( $upload_dir['path'] ) ) {
+			$file = $upload_dir['path'] . '/' . $filename;
+		}
+		else {
+			$file = $upload_dir['basedir'] . '/' . $filename;
+		}
+		
+		// Make sure the file is unique, if not, add a number to the end of the file before the extension
+		$i = 1;
+		$parts = pathinfo( $file );
+		while ( file_exists( $file ) ) {
+			$file = $parts['dirname'] . '/' . $parts['filename'] . '-' . $i . '.' . $parts['extension'];
+			$i++;
+		}
+
+		// Write the file
+		file_put_contents( $file, $image_data );
+		$attachment = [
+			'post_mime_type' => $file_type['type'],
+			'post_title' => $title ?? '',
+			'post_content' => $description ?? '',
+			'post_excerpt' => $caption ?? '',
+			'post_status' => 'inherit'
+		];
+		// Register the file as a Media Library attachment
+		$attachmentId = wp_insert_attachment( $attachment, $file );
+		require_once( ABSPATH . 'wp-admin/includes/image.php' );
+		$attachment_data = wp_generate_attachment_metadata( $attachmentId, $file );
+		wp_update_attachment_metadata( $attachmentId, $attachment_data );
+		update_post_meta( $attachmentId, '_wp_attachment_image_alt', $alt );
+		return $attachmentId;
+	}
+ 	#endregion
+
+	#region Context-Related Helpers
+	function retrieve_context( $params, $query ) {
+		$contextMaxLength = $params['contextMaxLength'] ?? $this->get_option( 'context_max_length', 4096 );
+    $embeddingsEnvId = $params['embeddingsEnvId'] ?? null;
+		$context = apply_filters( 'mwai_context_search', [], $query, [
+			'embeddingsEnvId' => $embeddingsEnvId
+		]);
+		if ( empty( $context ) ) {
+			return null;
+		}
+		else if ( !isset( $context['content'] ) ) {
+			error_log( "AI Engine: A context without content was returned." );
+			return null;
+		}
+		$context['content'] = $this->clean_sentences( $context['content'], $contextMaxLength );
+		$context['length'] = strlen( $context['content'] );
+		return $context;
+	}
+	#endregion
+
 	#region Users/Sessions Helpers
 
 	function get_nonce() {
-		if ( !is_user_logged_in() ) {
-			return null;
-		}
+		// if ( !is_user_logged_in() ) {
+		// 	return null;
+		// }
 		if ( isset( $this->nonce ) ) {
 			return $this->nonce;
 		}
@@ -201,6 +382,13 @@ class Meow_MWAI_Core
 
 	// Get the UserID from the data, or from the current user
   function get_user_id( $data = null ) {
+		// TODO: Not sure if that's the best way, but we should probably use an admin user as a fallback for CRON.
+		if ( defined( 'DOING_CRON' ) && DOING_CRON ) {
+			$admin = get_users( [ 'role' => 'administrator' ] );
+			if ( !empty( $admin ) ) {
+				return $admin[0]->ID;
+			}
+		}
     if ( isset( $data ) && isset( $data['userId'] ) ) {
       return (int)$data['userId'];
     }
@@ -213,7 +401,15 @@ class Meow_MWAI_Core
     return null;
   }
 
-	function getUserData() {
+	function get_admin_user() {
+		$admin = get_users( [ 'role' => 'administrator' ] );
+		if ( !empty( $admin ) ) {
+			return $admin[0];
+		}
+		return null;
+	}
+
+	function get_user_data() {
 		$user = wp_get_current_user();
 		if ( empty( $user ) || empty( $user->ID ) ) {
 			return null;
@@ -264,7 +460,13 @@ class Meow_MWAI_Core
 
 	#region Other Helpers
 
-	function generateRandomId( $length = 8, $excludeIds = [] ) {
+	public function check_rest_nonce( $request ) {
+    $nonce = $request->get_header( 'X-WP-Nonce' );
+    $rest_nonce = wp_verify_nonce( $nonce, 'wp_rest' );
+		return apply_filters( 'mwai_rest_authorized', $rest_nonce, $request );
+  }
+
+	function get_random_id( $length = 8, $excludeIds = [] ) {
 		$characters = '0123456789abcdefghijklmnopqrstuvwxyz';
 		$charactersLength = strlen( $characters );
 		$randomId = '';
@@ -272,16 +474,16 @@ class Meow_MWAI_Core
 			$randomId .= $characters[rand( 0, $charactersLength - 1 )];
 		}
 		if ( in_array( $randomId, $excludeIds ) ) {
-			return $this->generateRandomId( $length, $excludeIds );
+			return $this->get_random_id( $length, $excludeIds );
 		}
 		return $randomId;
 	}
 
-	function isUrl( $url ) {
+	function is_url( $url ) {
 		return strpos( $url, 'http' ) === 0 ? true : false;
 	}
 
-	function getPostTypes() {
+	function get_post_types() {
 		$excluded = array( 'attachment', 'revision', 'nav_menu_item' );
 		$post_types = array();
 		$types = get_post_types( [], 'objects' );
@@ -313,23 +515,29 @@ class Meow_MWAI_Core
 		return $post_types;
 	}
 
-	function getCleanPost( $post ) {
+	function get_post( $post ) {
+		if ( is_numeric( $post ) ) {
+			$post = get_post( $post );
+		}
 		if ( is_object( $post ) ) {
 			$post = (array)$post;
 		}
+		if ( !is_array( $post ) ) {
+			return null;
+		}
 		$language = $this->get_post_language( $post['ID'] );
-		$content = $this->getCleanPostContent( $post['ID'] );
+		$content = $this->get_post_content( $post['ID'] );
 		$title = $post['post_title'];
 		$excerpt = $post['post_excerpt'];
 		$url = get_permalink( $post['ID'] );
 		$checksum = wp_hash( $content . $title . $url );
 		return [
-			'postId' => $post['ID'],
+			'postId' => (int)$post['ID'],
 			'title' => $title,
 			'content' => $content,
 			'excerpt' => $excerpt,
 			'url' => $url,
-			'language' => $language,
+			'language' => $language ?? 'english',
 			'checksum' => $checksum,
 		];
 	}
@@ -337,49 +545,39 @@ class Meow_MWAI_Core
 
 	#region Usage & Costs
 
-	public function dynamic_max_tokens( $tokens, $text ) {
-		// Approximation (fast, no lib)
-    $asciiCount = 0;
-    $nonAsciiCount = 0;
-    for ( $i = 0; $i < mb_strlen( $text ); $i++ ) {
-      $char = mb_substr( $text, $i, 1 );
-      if ( ord( $char ) < 128 ) {
-        $asciiCount++;
-      }
-      else {
-        $nonAsciiCount++;
-      }
+	// Quick and dirty token estimation
+  // Let's keep this synchronized with Helpers in JS
+  static function estimate_tokens( ...$args ): int {
+    $text = "";
+    foreach ( $args as $arg ) {
+			if ( is_array( $arg ) ) {
+				foreach ( $arg as $message ) {
+					$text .= isset( $message['content']['text'] ) ? $message['content']['text'] : "";
+					$text .= isset( $message['content'] ) && is_string( $message['content'] ) ? $message['content'] : "";
+				}
+			}
+			else if ( is_string( $arg ) ) {
+				$text .= $arg;
+			}
     }
-    $asciiTokens = $asciiCount / 3.5;
-    $nonAsciiTokens = $nonAsciiCount * 2.5;
-    $tokens = $asciiTokens + $nonAsciiTokens;
-
-    // More exact (slower, and lib)
-    if ( PHP_VERSION_ID >= 70400 && function_exists( 'mb_convert_encoding' ) ) {
-      try {
-        $token_array = Encoder::encode( $text );
-        if ( !empty( $token_array ) ) {
-          $tokens = count( $token_array );
-        }
-      }
-      catch ( Exception $e ) {
-        error_log( $e->getMessage() );
-      }
+    $averageTokenLength = 4;
+    $words = preg_split( '/\s+/', trim( $text ) );
+    $tokenCount = 0;
+    foreach ( $words as $word ) {
+      $tokenCount += ceil( strlen( $word ) / $averageTokenLength );
     }
-
-		$tokens = $tokens;
-		return (int)$tokens;
+    return apply_filters( 'mwai_estimate_tokens', $tokenCount, $text );
 	}
 
-  public function recordTokensUsage( $model, $prompt_tokens, $completion_tokens = 0 ) {
-    if ( !is_numeric( $prompt_tokens ) ) {
-      throw new Exception( 'Record usage: prompt_tokens is not a number.' );
+  public function record_tokens_usage( $model, $in_tokens, $out_tokens = 0, $returned_price = null ) {
+    if ( !is_numeric( $in_tokens ) ) {
+      throw new Exception( 'AI Engine: in_tokens must be a number.' );
     }
-    if ( !is_numeric( $completion_tokens ) ) {
-      $completion_tokens = 0;
+    if ( !is_numeric( $out_tokens ) ) {
+      $out_tokens = 0;
     }
     if ( !$model ) {
-      throw new Exception( 'Record usage: model is missing.' );
+      throw new Exception( 'AI Engine: model is required.' );
     }
     $usage = $this->get_option( 'openai_usage' );
     $month = date( 'Y-m' );
@@ -387,29 +585,29 @@ class Meow_MWAI_Core
       $usage[$month] = array();
     }
     if ( !isset( $usage[$month][$model] ) ) {
-      $usage[$month][$model] = array(
-        'prompt_tokens' => 0,
-        'completion_tokens' => 0,
-        'total_tokens' => 0
-      );
+      $usage[$month][$model] = array( 'prompt_tokens' => 0, 'completion_tokens' => 0, 'total_tokens' => 0 );
     }
-    $usage[$month][$model]['prompt_tokens'] += $prompt_tokens;
-    $usage[$month][$model]['completion_tokens'] += $completion_tokens;
-    $usage[$month][$model]['total_tokens'] += $prompt_tokens + $completion_tokens;
+    $usage[$month][$model]['prompt_tokens'] += $in_tokens;
+    $usage[$month][$model]['completion_tokens'] += $out_tokens;
+    $usage[$month][$model]['total_tokens'] += $in_tokens + $out_tokens;
     $this->update_option( 'openai_usage', $usage );
-    return [
-      'prompt_tokens' => $prompt_tokens,
-      'completion_tokens' => $completion_tokens,
-      'total_tokens' => $prompt_tokens + $completion_tokens
+    $usageInfo = [
+      'prompt_tokens' => $in_tokens,
+      'completion_tokens' => $out_tokens,
+      'total_tokens' => $in_tokens + $out_tokens,
     ];
+		if ( $returned_price !== null ) {
+			$usageInfo['price'] = $returned_price;
+		}
+		return $usageInfo;
   }
 
-	public function recordAudioUsage( $model, $seconds ) {
+	public function record_audio_usage( $model, $seconds ) {
 		if ( !is_numeric( $seconds ) ) {
-			throw new Exception( 'Record usage: seconds is not a number.' );
+			throw new Exception( 'AI Engine: seconds must be a number.' );
 		}
 		if ( !$model ) {
-			throw new Exception( 'Record usage: model is missing.' );
+			throw new Exception( 'AI Engine: model is required.' );
 		}
 		$usage = $this->get_option( 'openai_usage' );
 		$month = date( 'Y-m' );
@@ -417,18 +615,14 @@ class Meow_MWAI_Core
 			$usage[$month] = array();
 		}
 		if ( !isset( $usage[$month][$model] ) ) {
-			$usage[$month][$model] = array(
-				'seconds' => 0
-			);
+			$usage[$month][$model] = array( 'seconds' => 0 );
 		}
 		$usage[$month][$model]['seconds'] += $seconds;
 		$this->update_option( 'openai_usage', $usage );
-		return [
-			'seconds' => $seconds
-		];
+		return [ 'seconds' => $seconds ];
 	}
 
-  public function recordImagesUsage( $model, $resolution, $images ) {
+  public function record_images_usage( $model, $resolution, $images ) {
     if ( !$model || !$resolution || !$images ) {
       throw new Exception( 'Missing parameters for record_image_usage.' );
     }
@@ -438,10 +632,7 @@ class Meow_MWAI_Core
       $usage[$month] = array();
     }
     if ( !isset( $usage[$month][$model] ) ) {
-      $usage[$month][$model] = array(
-        'resolution' => array(),
-        'images' => 0
-      );
+      $usage[$month][$model] = array( 'resolution' => array(), 'images' => 0 );
     }
     if ( !isset( $usage[$month][$model]['resolution'][$resolution] ) ) {
       $usage[$month][$model]['resolution'][$resolution] = 0;
@@ -449,10 +640,7 @@ class Meow_MWAI_Core
     $usage[$month][$model]['resolution'][$resolution] += $images;
     $usage[$month][$model]['images'] += $images;
     $this->update_option( 'openai_usage', $usage );
-    return [
-      'resolution' => $resolution,
-      'images' => $images
-    ];
+    return [ 'resolution' => $resolution, 'images' => $images ];
   }
 
 	#endregion
@@ -470,7 +658,7 @@ class Meow_MWAI_Core
 	#endregion
 
 	#region Options
-	function getThemes() {
+	function get_themes() {
 		$themes = get_option( $this->themes_option_name, [] );
 		$themes = empty( $themes ) ? [] : $themes;
 
@@ -495,12 +683,12 @@ class Meow_MWAI_Core
 		return array_merge(array_values($internalThemes), $customThemes);
 	}
 
-	function updateThemes( $themes ) {
+	function update_themes( $themes ) {
 		update_option( $this->themes_option_name, $themes );
 		return $themes;
 	}
 
-	function getChatbots() {
+	function get_chatbots() {
 		$chatbots = get_option( $this->chatbots_option_name, [] );
 		$hasChanges = false;
 		if ( empty( $chatbots ) ) {
@@ -514,16 +702,16 @@ class Meow_MWAI_Core
 				}
 			}
 			// After September 2023, let's remove this if statement.
-			if ( isset( $chatbot['chatId'] ) ) {
-				$chatbot['botId'] = $chatbot['chatId'];
-				unset( $chatbot['chatId'] );
-				$hasChanges = true;
-			}
+			// if ( isset( $chatbot['chatId'] ) ) {
+			// 	$chatbot['botId'] = $chatbot['chatId'];
+			// 	unset( $chatbot['chatId'] );
+			// 	$hasChanges = true;
+			// }
 			// After September 2023, let's remove this if statement.
-			if ( empty( $chatbot['botId'] ) && $chatbot['name'] === 'default' ) {
-				$chatbot['botId'] = sanitize_title( $chatbot['name'] );
-				$hasChanges = true;
-			}
+			// if ( empty( $chatbot['botId'] ) && $chatbot['name'] === 'default' ) {
+			// 	$chatbot['botId'] = sanitize_title( $chatbot['name'] );
+			// 	$hasChanges = true;
+			// }
 		}
 		if ( $hasChanges ) {
 			update_option( $this->chatbots_option_name, $chatbots );
@@ -531,22 +719,52 @@ class Meow_MWAI_Core
 		return $chatbots;
 	}
 
-	function getChatbot( $botId ) {
-		$chatbots = $this->getChatbots();
+	function get_chatbot( $botId ) {
+		$chatbots = $this->get_chatbots();
 		foreach ( $chatbots as $chatbot ) {
 			if ( $chatbot['botId'] === (string)$botId ) {
-				// Somehow, the default was set to "openai" when creating a new chatbot, but that overrided
-				// the default value in the Settings. It should be always empty here (except if we add this
-				// into the Settings of the chatbot).
-				$chatbot['service'] = null;
 				return $chatbot;
 			}
 		}
 		return null;
 	}
 
-	function getTheme( $themeId ) {
-		$themes = $this->getThemes();
+	function get_embeddings_env( $envId ) {
+		$envs = $this->get_option( 'embeddings_envs' );
+		foreach ( $envs as $env ) {
+			if ( $env['id'] === $envId ) {
+				return $env;
+			}
+		}
+		return null;
+	}
+
+	function get_ai_env( $envId ) {
+		$envs = $this->get_option( 'ai_envs' );
+		foreach ( $envs as $env ) {
+			if ( $env['id'] === $envId ) {
+				return $env;
+			}
+		}
+		return null;
+	}
+
+	function get_assistant( $envId, $assistantId ) {
+		$env = $this->get_ai_env( $envId );
+		if ( !$env ) {
+			return null;
+		}
+		$assistants = $env['assistants'];
+		foreach ( $assistants as $assistant ) {
+			if ( $assistant['id'] === $assistantId ) {
+				return $assistant;
+			}
+		}
+		return null;
+	}
+
+	function get_theme( $themeId ) {
+		$themes = $this->get_themes();
 		foreach ( $themes as $theme ) {
 			if ( $theme['themeId'] === $themeId ) {
 				return $theme;
@@ -555,11 +773,16 @@ class Meow_MWAI_Core
 		return null;
 	}
 
-	function updateChatbots( $chatbots ) {
+	function update_chatbots( $chatbots ) {
+		$deprecatedFields = [ 'env', 'embeddingsIndex', 'embeddingsNamespace', 'service' ];
 		$htmlFields = [ 'textCompliance', 'aiName', 'userName', 'startSentence' ];
 		$whiteSpacedFields = [ 'context' ];
 		foreach ( $chatbots as &$chatbot ) {
 			foreach ( $chatbot as $key => &$value ) {
+				if ( in_array( $key, $deprecatedFields ) ) {
+					unset( $chatbot[$key] );
+					continue;
+				}
 				if ( in_array( $key, $htmlFields ) ) {
 					$value = wp_kses_post( $value );
 				}
@@ -571,17 +794,20 @@ class Meow_MWAI_Core
 				}
 			}
 		}
-
-		update_option( $this->chatbots_option_name, $chatbots );
+		if ( !update_option( $this->chatbots_option_name, $chatbots ) ) {
+			error_log( 'AI Engine: Could not update chatbots.' );
+			$chatbots = get_option( $this->chatbots_option_name, [] );
+			return $chatbots;
+		}
 		return $chatbots;
 	}
 
 	function get_all_options( $force = false ) {
 		// We could cache options this way, but if we do, the apply_filters seems to be called too early.
 		// That causes issues with the mwai_languages filter.
-		if ( !$force && !is_null( $this->options ) ) {
-			return $this->options;
-		}
+		// if ( !$force && !is_null( $this->options ) ) {
+		// 	return $this->options;
+		// }
 		$options = get_option( $this->option_name, [] );
 		$options = $this->sanitize_options( $options );
 		foreach ( MWAI_OPTIONS as $key => $value ) {
@@ -593,13 +819,19 @@ class Meow_MWAI_Core
 				$options[$key] = apply_filters( 'mwai_languages', MWAI_LANGUAGES );
 			}
 		}
-		$options['shortcode_chat_default_params'] = MWAI_CHATBOT_PARAMS;
 		$options['chatbot_defaults'] = MWAI_CHATBOT_DEFAULT_PARAMS;
 		$options['default_limits'] = MWAI_LIMITS;
-		$options['openai_models'] = Meow_MWAI_Engines_OpenAI::get_openai_models();
+		$options['openai_models'] = apply_filters( 
+			'mwai_openai_models',
+			Meow_MWAI_Engines_OpenAI::get_models_static()
+		);
+		$options['anthropic_models'] = apply_filters( 
+			'mwai_anthropic_models',
+			Meow_MWAI_Engines_Anthropic::get_models_static()
+		);
 		$options['fallback_model'] = MWAI_FALLBACK_MODEL;
 
-		$this->options = $options;
+		//$this->options = $options;
 		return $options;
 	}
 
@@ -608,6 +840,25 @@ class Meow_MWAI_Core
 	function sanitize_options( $options ) {
 		$needs_update = false;
 
+		// This list was updated on December 11, 2023. After May 2024, let's remove this.
+		$old_options = [
+			'shortcode_chat_default_params',
+			'shortcode_chat_params_override',
+			'module_legacy_finetunes',
+			'shortcode_chat_legacy',
+			'shortcode_chat_inject',
+			'shortcode_chat_styles',
+			'dynamic_max_tokens',
+			'shortcode_chat_formatting',
+			'shortcode_forms_legacy',
+		];
+		foreach ( $old_options as $old_option ) {
+			if ( isset( $options[$old_option] ) ) {
+				unset( $options[$old_option] );
+				$needs_update = true;
+			}
+		}
+
 		// This upgrades namespace to multi-namespaces (June 2023)
 		// After January 2024, let's remove this.
 		if ( isset( $options['pinecone'] ) && isset( $options['pinecone']['namespace'] ) ) {
@@ -615,12 +866,11 @@ class Meow_MWAI_Core
 			unset( $options['pinecone']['namespace'] );
 			$needs_update = true;
 		}
-
 		// Support for Multi Vector DB Environments
 		// After June 2024, let's remove this.
 		if ( !isset( $options['embeddings_envs'] ) ) {
 			$options['embeddings_envs'] = [];
-			$default_id = $this->generateRandomId();
+			$default_id = $this->get_random_id();
 			$pinecone = isset( $options['pinecone'] ) ? $options['pinecone'] : [];
 			$options['embeddings_envs'][] = [
 				'id' => $default_id,
@@ -639,13 +889,12 @@ class Meow_MWAI_Core
 			unset( $options['pinecone'] );
 			$needs_update = true;
 		}
-
 		// Support for Multi AI Environments
 		// After June 2024, let's remove this.
 		if ( !isset( $options['ai_envs'] ) ) {
 			$options['ai_envs'] = [];
-			$default_openai_id = $this->generateRandomId();
-			$default_azure_id = $this->generateRandomId();
+			$default_openai_id = $this->get_random_id();
+			$default_azure_id = $this->get_random_id();
 			$openai_service = isset( $options['openai_service'] ) ? $options['openai_service'] : 'openai';
 			$openai_apikey = isset( $options['openai_apikey'] ) ? $options['openai_apikey'] : '';
 			$azure_endpoint = isset( $options['openai_azure_endpoint'] ) ? $options['openai_azure_endpoint'] : '';
@@ -692,7 +941,6 @@ class Meow_MWAI_Core
 			}
 			$needs_update = true;
 		}
-
 		if ( !empty( $options['openai_apikey'] ) || !empty( $options['openai_azure_apikey'] ) ) {
 			unset( $options['openai_apikey'] );
 			unset( $options['openai_finetunes'] );
@@ -712,7 +960,7 @@ class Meow_MWAI_Core
 		if ( isset( $options['embeddings_envs'] ) ) {
 			foreach ( $options['embeddings_envs'] as &$env ) {
 				if ( !isset( $env['id'] ) ) {
-					$env['id'] = $this->generateRandomId();
+					$env['id'] = $this->get_random_id();
 					$needs_update = true;
 				}
 				if ( $env['id'] === $options['embeddings_default_env'] ) {
@@ -730,7 +978,7 @@ class Meow_MWAI_Core
 		if ( isset( $options['ai_envs'] ) ) {
 			foreach ( $options['ai_envs'] as &$env ) {
 				if ( !isset( $env['id'] ) ) {
-					$env['id'] = $this->generateRandomId();
+					$env['id'] = $this->get_random_id();
 					$needs_update = true;
 				}
 				if ( $env['id'] === $options['ai_default_env'] ) {
@@ -781,7 +1029,10 @@ class Meow_MWAI_Core
 	}
 
 	function reset_options() {
-		return $this->update_options( MWAI_OPTIONS );
+		delete_option( $this->themes_option_name );
+		delete_option( $this->chatbots_option_name );
+		delete_option( $this->option_name );
+		return $this->get_all_options( true );
 	}
 	#endregion
 }
